@@ -8,14 +8,17 @@ Generate_image.py - ComfyUI API 图片生成模块
 │                          部件生成：部件参考图
 │                          整体生成：粗糙结构参考图（添加到图片数组末尾）
 ├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
-├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── Component_three/     → 部件生成的三张候选图（临时，用户选择后清空）
+├── generated_images/    → 用户选择的部件图（临时，存入记忆后移动到 processed_images）
 ├── processed_images/    → 已存记忆的图片（永久保留）
+├── Feedback_image/      → AI问答后生成的图片
 
 使用流程：
 1. 前端上传参考图到 original_image/（调用 /upload_reference_image）
 2. 系统自动从 original_image/ 读取参考图进行生成
-3. 生成的图片输出到 generated_images/ 文件夹
-4. 存入记忆后，图片移动到 processed_images/ 文件夹
+3. 部件生成：三张候选图输出到 Component_three/，用户选择后复制到 generated_images/
+4. 整体生成：直接输出到 generated_images/
+5. 存入记忆后，图片从 generated_images/ 移动到 processed_images/
 
 关键函数：
 - get_original_image(): 获取 original_image/ 中的唯一图片
@@ -27,6 +30,7 @@ import os
 import json
 import time
 import uuid
+import urllib.parse
 import base64
 import requests
 import websocket
@@ -53,6 +57,8 @@ from generate import (
 ORIGINAL_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "original_image")
 # processed_images 文件夹路径
 PROCESSED_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "processed_images")
+# Component_three 文件夹路径（部件生成的三张候选图）
+COMPONENT_THREE_DIR = os.path.join(os.path.dirname(__file__), "Component_three")
 
 
 def get_original_image() -> str:
@@ -269,9 +275,10 @@ API_CLIENT_ID = "comfyui-54ae45038ffb9ec10eb61cf40f84c436623b70e64a5cbcd9bb4cc86
 COMFY_API_KEY = "comfyui-54ae45038ffb9ec10eb61cf40f84c436623b70e64a5cbcd9bb4cc864a099c7bd"  # ComfyAPI API Key
 
 # 工作流模板路径
-COMPONENT_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/Component_generation.json"  # 部件生成
-OVERALL_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/google_Gemini_image.json"     # 整体生成
-TEXT_TO_IMAGE_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/Text-to-Image.json"     # 纯文本生成
+# 工作流模板路径（相对于项目目录）
+COMPONENT_WORKFLOW_PATH = os.path.join(os.path.dirname(__file__), "Component_generation.json")
+OVERALL_WORKFLOW_PATH = os.path.join(os.path.dirname(__file__), "google_Gemini_image.json")
+TEXT_TO_IMAGE_WORKFLOW_PATH = os.path.join(os.path.dirname(__file__), "Text-to-Image.json")  # 纯文本生成
 
 
 # ========== ComfyUI API 客户端 ==========
@@ -583,21 +590,15 @@ def translate_to_english(text: str) -> str:
     if not has_chinese:
         return text
 
-    # 使用 Google Translate 免费 API
+    # 使用 Google Translate 免费 API（用 requests 自带证书包，避免 macOS SSL 问题）
     try:
-        import urllib.parse
-        import urllib.request
-
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh&tl=en&dt=t&q={urllib.parse.quote(text)}"
-
-        with urllib.request.urlopen(url, timeout=10) as response:
-            result = response.read().decode('utf-8')
-            # 解析返回结果
-            import json
-            data = json.loads(result)
-            translated = ''.join([item[0] for item in data[0] if item[0]])
-            print(f"[Translate] {text[:50]}... -> {translated[:50]}...")
-            return translated
+        response = requests.get(url, timeout=10)
+        result = response.text
+        data = json.loads(result)
+        translated = ''.join([item[0] for item in data[0] if item[0]])
+        print(f"[Translate] {text[:50]}... -> {translated[:50]}...")
+        return translated
     except Exception as e:
         print(f"[Translate] Failed: {e}, using original text")
         return text
@@ -773,7 +774,7 @@ def prepare_workflow_component(
                 "seed": seed if seed is not None else 42,
                 "aspect_ratio": "auto",
                 "response_modalities": "IMAGE+TEXT",
-                "system_prompt": "You are an expert image-generation engine. You must ALWAYS produce an image."
+                "system_prompt": "You are a top-tier image generation expert and must always produce images. When a user provides a reference image, recognize it as a preliminary physical white model or low-fidelity prototype, using it solely as a framework reference for spatial proportions, mass distribution, and basic structure.\nThe physical white film reference image provided by the user must be strictly regarded as the core framework, and about 60% of the visual center of gravity should accurately reference the overall outline, volume ratio, and spatial position relationship of each component of the original image. For example, the layout of omnidirectional wheels, the low height and basic geometric shape of the chassis, these core structural features must be highly restored and should not be significantly modified or arbitrarily moved.\nAt the same time, you should independently incorporate reasonable visual details, material textures, and functional components based on industrial design logic, transforming the rudimentary white film into a professional design work with high completion.\nIf the user's prompt is vague or lacks specific visual descriptions, you must exercise creativity and conceive a concrete visual concept based on the morphological characteristics of the white film. Always prioritize generating high-quality, concrete visual images, ensuring the output respects the original physical contours while embodying forward-thinking industrial aesthetics."
             }
         },
         "30": {
@@ -809,9 +810,14 @@ def prepare_workflow_overall(
     if len(image_paths) > 9:
         raise ValueError("最多支持9张输入图片")
 
-    # 上传所有图片
+    # 上传所有图片 + 白色占位图
     client = ComfyUIClient()
     uploaded_filenames = []
+
+    # 先上传白色占位图
+    WHITE_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "white_image.png")
+    placeholder_upload = client.upload_image(WHITE_IMAGE_PATH)
+    placeholder_name = placeholder_upload.get('name')
 
     for i, image_path in enumerate(image_paths):
         upload_result = client.upload_image(image_path)
@@ -836,11 +842,11 @@ def prepare_workflow_overall(
                 }
             }
         else:
-            # 未使用的节点用白色占位图
+            # 未使用的节点用上传的白色占位图
             api_workflow[str(node_id)] = {
                 "class_type": "LoadImage",
                 "inputs": {
-                    "image": "white_placeholder.png"
+                    "image": placeholder_name
                 }
             }
 
@@ -900,13 +906,16 @@ def generate_component_image(
     """
     部件图片生成：文本 + 1张参考图 → 新图片
 
+    生成的三张候选图默认保存到 Component_three/ 文件夹，
+    命名为 {save_name}_0.png, {save_name}_1.png, {save_name}_2.png
+
     Args:
         prompt: 图像生成提示词
         image_path: 输入图片路径（部件参考图）
         workflow_path: 工作流模板路径（默认为 Component_generation.json）
         seed: 种子值
-        output_dir: 输出目录（默认为 generated_images 文件夹）
-        save_name: 保存的文件名（不含扩展名，如 "把手"）
+        output_dir: 输出目录（默认 Component_three 文件夹）
+        save_name: 保存的文件名前缀（不含扩展名，如 "履带" → 履带_0.png, 履带_1.png, 履带_2.png）
         timeout: 超时时间（秒）
 
     Returns:
@@ -916,9 +925,10 @@ def generate_component_image(
     print(f"[Input] Prompt: {prompt[:100]}...")
     print(f"[Input] Image: {image_path}")
 
-    # 默认输出目录
+    # 默认输出目录为 Component_three
     if output_dir is None:
-        output_dir = os.path.join(os.path.dirname(__file__), "generated_images")
+        output_dir = COMPONENT_THREE_DIR
+        os.makedirs(output_dir, exist_ok=True)
 
     # 加载工作流
     workflow = load_workflow_template(workflow_path)
@@ -1327,7 +1337,8 @@ def generate_component_with_prompt(
     2. prepare_workflow_component() 翻译为英文 + 构建工作流
     3. 提交到 ComfyUI 并获取生成的图片
 
-    生成的图片保存到 generated_images 文件夹，文件名为部件名
+    生成的三张候选图保存到 Component_three 文件夹，命名为 {component_name}_0, _1, _2
+    用户选择后再通过 /select_component_image 接口确认
 
     Args:
         component_name: 部件名称（同时作为保存文件名）
@@ -1337,7 +1348,7 @@ def generate_component_with_prompt(
         trigger_generate: 是否触发生成（1=触发，0=不触发）
         workflow_path: 工作流模板路径
         seed: 种子值
-        output_dir: 输出目录（默认为 generated_images 文件夹）
+        output_dir: 输出目录（默认 Component_three 文件夹）
         timeout: 超时时间（秒）
 
     Returns:

@@ -6,11 +6,12 @@ Memory.py - 记忆节点与管理模块
 文件夹说明：
 ├── original_image/      → 原始参考图（永久保留，用于图像生成参考）
 ├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
-├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── Component_three/     → 部件生成的三张候选图（临时，用户选择后清空）
+├── generated_images/    → 用户选择的部件图（临时，存入记忆后移动到 processed_images）
 ├── processed_images/    → 已存记忆的图片（永久保留）
 
 图片存储说明：
-- component_image 和 overall_image 来自 generated_images（图像生成后的结果）
+- component_image 和 overall_image 来自 generated_images（用户从 Component_three 选择后放入）
 - 存入记忆后，图片移动到 processed_images 文件夹
 - Operated_image 的图片用于 VLM 分析，不存入记忆
 """
@@ -203,7 +204,6 @@ def find_or_update_description(
     new_desc = make_description(new_content, new_status)
     updated_embeddings = text_embeddings_list + [new_embedding.tolist()]
     return description_list + [new_desc], updated_embeddings, False
-
 
 # ========== 记忆管理函数 ==========
 
@@ -760,12 +760,39 @@ def update_description_content(
     type_mapping = {
         "结构": "structure_descriptions",
         "功能": "function_descriptions",
-        "不确定点": "uncertain_descriptions",  # 这个是外观不确定的描述
-        "外形": "appearance_descriptions"
+        "不确定点": None  # 不确定点跨三个字段查找 status=0
     }
 
     if desc_type not in type_mapping:
-        return False, f"不支持的描述类型：'{desc_type}'，可选值：结构、功能、不确定点、外形"
+        return False, f"不支持的描述类型：'{desc_type}'，可选值：结构、功能、不确定点"
+
+    # 处理"不确定点"：跨三个描述字段查找 status=0 的条目
+    if desc_type == "不确定点":
+        search_fields = ["structure_descriptions", "function_descriptions", "appearance_descriptions"]
+
+        if target_name.lower() == "整体":
+            search_fields = ["overall_structures", "overall_functions", "overall_appearances"]
+
+        for node_id, data in memory_db.items():
+            is_match = False
+            if target_name.lower() == "整体" and data.get('node_type') == 'OVERALL':
+                is_match = True
+            elif data.get('node_type') == 'COMPONENT' and data.get('component_name', '').lower() == target_name.lower():
+                is_match = True
+
+            if is_match:
+                for field in search_fields:
+                    descriptions = data.get(field, [])
+                    for i, desc in enumerate(descriptions):
+                        if desc.get('status', 1) == 0 and desc.get('content', '') == old_content:
+                            descriptions[i]['content'] = new_content
+                            data[field] = descriptions
+                            data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                            return True, f"不确定点已从 '{old_content}' 更新为 '{new_content}'"
+
+                return False, f"{target_name} 中未找到不确定内容：'{old_content}'"
+
+        return False, f"未找到节点：{target_name}"
 
     field_name = type_mapping[desc_type]
 
@@ -773,9 +800,7 @@ def update_description_content(
     if target_name.lower() == "整体":
         overall_field_mapping = {
             "结构": "overall_structures",
-            "功能": "overall_functions",
-            "不确定点": "overall_appearances",  # 整体的不确定点
-            "外形": "overall_appearances"
+            "功能": "overall_functions"
         }
         overall_field_name = overall_field_mapping.get(desc_type)
 
@@ -863,8 +888,24 @@ def add_description_from_answer(
         "结构": "structure_descriptions"
     }
 
+    # 处理"背景"类型（design_background 是 OVERALL 节点上的单值字段，不是列表）
+    if desc_type == "背景":
+        for node_id, data in memory_db.items():
+            if data.get('node_type') == 'OVERALL':
+                data['design_background'] = answer.strip()
+                data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                print(f"[Success] Updated overall design_background")
+                return True, f"已更新整体设计背景：'{answer}'"
+
+        # 没找到整体节点，创建新的
+        new_overall = OverallNode()
+        new_overall.design_background = answer.strip()
+        memory_db[new_overall.node_id] = new_overall.model_dump()
+        print(f"[Success] Created overall with design_background")
+        return True, f"已创建整体节点并设置设计背景：'{answer}'"
+
     if desc_type not in type_mapping:
-        return False, f"不支持的描述类型：'{desc_type}'，可选值：外形、功能、结构"
+        return False, f"不支持的描述类型：'{desc_type}'，可选值：外形、功能、结构、背景"
 
     field_name = type_mapping[desc_type]
 

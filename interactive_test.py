@@ -11,7 +11,7 @@ interactive_test.py - 交互式 API 测试工具
 import requests
 import os
 
-BASE_URL = "http://localhost:5000"
+BASE_URL = "http://localhost:9000"
 
 def print_response(response):
     """打印响应结果"""
@@ -73,6 +73,7 @@ def interactive_test():
         print("\n【其他】")
         print("  20. 清空屏幕")
         print("  0. 退出")
+        print("-"*50)
         print("-"*50)
 
         choice = input("\n请输入编号: ").strip()

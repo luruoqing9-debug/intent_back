@@ -16,7 +16,7 @@ os.makedirs(OPERATED_IMAGE_DIR, exist_ok=True)
 os.makedirs(DETECTED_IMAGE_DIR, exist_ok=True)
 
 # API 配置
-API_BASE_URL = "http://localhost:5000"  # api.py 的服务地址
+API_BASE_URL = "http://localhost:8080"  # api.py 的服务地址
 
 class StreamTrigger:
     def __init__(self, stream_source, listener_func, trigger_action, check_interval=0.1):

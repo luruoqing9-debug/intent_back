@@ -4,14 +4,15 @@ api.py - HTTP API 接口层
 遵循 main.py 的业务逻辑，不过度拆分也不过度整合。
 
 启动方式：python api.py
-服务地址：http://localhost:5000
+服务地址：http://localhost:9000
 
 文件夹说明：
 ├── original_image/      → 参考图（始终只有一张，上传新图时自动替换旧的）
 │                          部件生成：部件参考图
 │                          整体生成：粗糙结构参考图
 ├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
-├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── Component_three/     → 部件生成的三张候选图（临时，用户选择后清空）
+├── generated_images/    → 用户选择的部件图（临时，存入记忆后移动到 processed_images）
 ├── processed_images/    → 已存记忆的图片（永久保留，前端使用此路径）
 
 接口分类：
@@ -31,11 +32,13 @@ api.py - HTTP API 接口层
 ├── 用户反馈
 │   ├── POST /user_feedback    - 处理用户对AI建议的反馈（更新评分权重）
 │
-├── 图像生成（自动读取 original_image，输出到 generated_images）
+├── 图像生成（自动读取 original_image，输出到 Component_three 或 generated_images）
 │   ├── POST /generate_prompt     - 生成提示词（自动检测粗糙参考图）
 │   ├── POST /generate_image      - 调用 ComfyUI 生成图像
-│                          mode=1（部件）：自动读取 original_image/ 参考图
+│                          mode=1（部件）：三张候选图保存到 Component_three/
 │                          mode=2（整体）：自动读取 processed_images/ 部件图 + original_image/ 粗糙参考图
+│   ├── POST /select_component_image - 用户从 Component_three/ 选择一张部件图
+│   ├── POST /update_memory_from_prompt - 对比提示词变化，自动更新记忆
 │   ├── POST /generate_from_answer - 从AI回答生成图片（mico=1问答后调用，自动清空记录）
 │
 ├── 状态查询
@@ -60,6 +63,7 @@ import sys
 import json
 import threading
 import time
+import urllib.parse
 import base64
 
 # 禁用警告
@@ -110,7 +114,7 @@ from main import (
 from Feedback import generate_ai_feedback, memory_qa_round, get_uncertain_suggestions, process_user_feedback
 
 # 导入提示词生成函数
-from generate import process_generate_request
+from generate import process_generate_request, update_memory_from_prompt_change
 
 # 导入图像生成函数
 from Generate_image import (
@@ -118,7 +122,8 @@ from Generate_image import (
     generate_overall_image,
     get_original_image,
     get_processed_component_images,
-    generate_image_from_ai_answer
+    generate_image_from_ai_answer,
+    COMPONENT_THREE_DIR
 )
 
 # 导入记忆更新函数
@@ -146,10 +151,11 @@ os.makedirs(ORIGINAL_IMAGE_DIR, exist_ok=True)
 os.makedirs(PROCESSED_IMAGE_DIR, exist_ok=True)
 os.makedirs(GENERATED_IMAGE_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_IMAGE_DIR, exist_ok=True)
+os.makedirs(COMPONENT_THREE_DIR, exist_ok=True)
 
 
 def path_to_url(local_path: str) -> str:
-    """
+    r"""
     将本地路径转换为 HTTP URL
 
     Args:
@@ -158,7 +164,7 @@ def path_to_url(local_path: str) -> str:
                     - 相对路径：original_image/xxx.png 或 original_image\xxx.png
 
     Returns:
-        URL，如 "http://localhost:5000/images/original/xxx.png"
+        URL，如 "http://localhost:9000/images/original/xxx.png"
     """
     if not local_path:
         return ""
@@ -174,22 +180,27 @@ def path_to_url(local_path: str) -> str:
     filename = None
 
     for i, part in enumerate(parts):
-        if part in ["original_image", "processed_images", "generated_images", "Feedback_image"]:
+        if part in ["original_image", "processed_images", "generated_images", "Feedback_image", "Component_three"]:
             folder = part
             # 文件名是后面的部分
             filename = parts[i + 1] if i + 1 < len(parts) else None
             break
 
     if folder and filename:
+        encoded_filename = urllib.parse.quote(filename)
+        print(f"[path_to_url] 输入: {local_path}")
+        print(f"[path_to_url] folder={folder}, filename={filename}, encoded={encoded_filename}")
         # 统一 Feedback_image 到 generated_images 路由
         if folder == "Feedback_image":
-            return f"http://localhost:5000/images/generated/{filename}"
+            return f"http://localhost:9000/images/generated/{encoded_filename}"
         elif folder == "original_image":
-            return f"http://localhost:5000/images/original/{filename}"
+            return f"http://localhost:9000/images/original/{encoded_filename}"
         elif folder == "processed_images":
-            return f"http://localhost:5000/images/processed/{filename}"
+            return f"http://localhost:9000/images/processed/{encoded_filename}"
         elif folder == "generated_images":
-            return f"http://localhost:5000/images/generated/{filename}"
+            return f"http://localhost:9000/images/generated/{encoded_filename}"
+        elif folder == "Component_three":
+            return f"http://localhost:9000/images/component_three/{encoded_filename}"
 
     return local_path
 
@@ -225,6 +236,15 @@ def serve_generated_image(filename):
     if os.path.exists(filepath):
         return send_file(filepath)
 
+    return jsonify({"error": "文件不存在"}), 404
+
+
+@app.route('/images/component_three/<filename>')
+def serve_component_three_image(filename):
+    """提供 Component_three 文件夹的候选图片"""
+    filepath = os.path.join(COMPONENT_THREE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
     return jsonify({"error": "文件不存在"}), 404
 
 
@@ -601,6 +621,42 @@ def api_vlm_analysis_images():
         }), 500
 
 
+@app.route('/upload_reference_image', methods=['POST'])
+def api_upload_reference_image():
+    """
+    上传参考图到 original_image/ 文件夹。
+    每次上传会替换掉旧的文件（始终只保留一张）。
+
+    输入: multipart/form-data，字段名 "image"
+    输出: {"success": true, "filename": "reference.png"}
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "缺少 image 文件"}), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "文件名为空"}), 400
+
+        # 始终保存为固定文件名，方便后端读取
+        save_filename = "reference.png"
+        save_path = os.path.join(ORIGINAL_IMAGE_DIR, save_filename)
+        file.save(save_path)
+        print(f"[Upload] 参考图已保存: {save_path}")
+
+        return jsonify({
+            "success": True,
+            "filename": save_filename,
+            "url": path_to_url(save_path)
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 @app.route('/generate_prompt', methods=['POST'])
 def api_generate_prompt():
     """
@@ -739,7 +795,9 @@ def api_generate_image():
 
     文件夹说明：
     - original_image/   → 参考图来源（前端上传，始终只有一张）
-    - generated_images/ → 生成图片存放位置
+    - mode=1（部件）：三张候选图保存到 Component_three/，需调用 /select_component_image 选择
+    - mode=2（整体）：生成图片保存到 generated_images/，自动更新记忆
+    - generated_images/ → 用户选择后的部件图 / 整体图存放位置
 
     输入:
         mode=1（部件生成）:
@@ -760,11 +818,20 @@ def api_generate_image():
         }
 
     输出:
+        mode=1:
+        {
+            "success": true,
+            "candidates": ["http://localhost:9000/images/component_three/履带_0.png", ...],
+            "reference_image_used": "original_image/xxx.png",
+            "message": "已生成3张候选图，请调用 /select_component_image 选择一张"
+        }
+
+        mode=2:
         {
             "success": true/false,
-            "image_paths": ["processed_images/履带.png"],  // 最终存储路径
-            "reference_image_used": "original_image/xxx.png",  // 使用的参考图路径
-            "component_images_used": ["processed_images/履带.png", ...]  // mode=2时返回使用的部件图
+            "image_paths": ["processed_images/overall.png"],
+            "reference_image_used": "original_image/xxx.png",
+            "component_images_used": ["processed_images/履带.png", ...]
         }
     """
     try:
@@ -773,6 +840,7 @@ def api_generate_image():
         prompt = data.get('prompt', '')
         save_name = data.get('save_name')
         component_name = data.get('component_name')
+        seed = data.get('seed')
 
         # 项目目录（用于路径转换）
         project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -810,14 +878,26 @@ def api_generate_image():
 
             final_save_name = save_name or component_name
 
-            print(f"[generate_image] 部件生成: {final_save_name}")
+            print(f"[generate_image] 部件生成（3张候选图）: {final_save_name}")
             print(f"[generate_image] 参考图: {reference_image}")
 
-            saved_paths = generate_component_image(
-                prompt=prompt,
-                image_path=reference_image,
-                save_name=final_save_name
-            )
+            import random
+            saved_paths = []
+            for i in range(3):
+                seed = random.randint(1, 999999)
+                paths = generate_component_image(
+                    prompt=prompt,
+                    image_path=reference_image,
+                    save_name=final_save_name,
+                    seed=seed
+                )
+                if paths:
+                    # 重命名为 {final_save_name}_{i}.png
+                    import shutil
+                    new_path = os.path.join(COMPONENT_THREE_DIR, f"{final_save_name}_{i}{os.path.splitext(paths[0])[1]}")
+                    shutil.move(paths[0], new_path)
+                    saved_paths.append(new_path)
+                    print(f"[generate_image] 候选图 {i}: {new_path}")
 
             if not saved_paths:
                 return jsonify({
@@ -825,21 +905,14 @@ def api_generate_image():
                     "error": "图像生成失败"
                 }), 500
 
-            # 更新记忆（图片移动到 processed_images）
-            batch_update_images(memory_db)
-            save_memory()
-
-            # 转换路径：generated_images → processed_images
-            final_paths = []
-            for path in saved_paths:
-                filename = os.path.basename(path)
-                final_path = os.path.join(processed_images_dir, filename)
-                final_paths.append(path_to_url(final_path))
+            # 返回候选图列表（Component_three/ 中的图片）
+            candidate_urls = [path_to_url(p) for p in saved_paths]
 
             return jsonify({
                 "success": True,
-                "image_paths": final_paths,
-                "reference_image_used": path_to_url(reference_image)
+                "candidates": candidate_urls,
+                "reference_image_used": path_to_url(reference_image),
+                "message": "已生成3张候选图，请调用 /select_component_image 选择一张"
             })
 
         elif mode == 2:
@@ -914,6 +987,191 @@ def api_generate_image():
                 "success": False,
                 "error": "无效的 mode（只能是 1 或 2）"
             }), 400
+
+    except Exception as e:
+        import traceback
+        print(f"[generate_image] ERROR: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/select_component_image', methods=['POST'])
+def api_select_component_image():
+    """
+    用户从 Component_three/ 中选择一张部件候选图
+
+    流程：
+    1. 用户调用 /generate_image (mode=1) 生成3张候选图到 Component_three/
+    2. 前端展示候选图，用户选择一张
+    3. 调用此接口，传入选中的文件名（如 "履带_1.png"）
+    4. 系统将选中图片复制到 generated_images/（重命名为 {component_name}.png）
+    5. 清空 Component_three/ 中的所有图片
+    6. 调用 batch_update_images 更新记忆，图片移动到 processed_images/
+
+    输入:
+        {
+            "component_name": "履带",          // 必需：部件名称
+            "selected_filename": "履带_1.png"  // 必需：选中的候选图文件名
+        }
+
+    输出:
+        {
+            "success": true,
+            "image_paths": ["http://localhost:9000/images/processed/履带.png"],
+            "message": "已选择履带_1.png，已更新记忆"
+        }
+    """
+    try:
+        data = request.json or {}
+        component_name = data.get('component_name')
+        selected_filename = data.get('selected_filename')
+
+        if not component_name:
+            return jsonify({
+                "success": False,
+                "error": "缺少 component_name 参数"
+            }), 400
+
+        if not selected_filename:
+            return jsonify({
+                "success": False,
+                "error": "缺少 selected_filename 参数"
+            }), 400
+
+        # 检查 Component_three 中是否存在该文件
+        candidate_path = os.path.join(COMPONENT_THREE_DIR, selected_filename)
+        if not os.path.exists(candidate_path):
+            return jsonify({
+                "success": False,
+                "error": f"候选图不存在: {selected_filename}"
+            }), 400
+
+        # 将选中图片复制到 generated_images/，重命名为 {component_name}.png
+        import shutil
+        target_filename = f"{component_name}{os.path.splitext(selected_filename)[1]}"
+        target_path = os.path.join(GENERATED_IMAGE_DIR, target_filename)
+        shutil.copy(candidate_path, target_path)
+        print(f"[select] 已复制: {selected_filename} → {target_filename}")
+
+        # 清空 Component_three/ 中的所有图片
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}
+        for f in os.listdir(COMPONENT_THREE_DIR):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in image_extensions:
+                os.remove(os.path.join(COMPONENT_THREE_DIR, f))
+                print(f"[select] 已删除候选图: {f}")
+
+        # 更新记忆（图片移动到 processed_images）
+        batch_update_images(memory_db)
+        save_memory()
+
+        # 转换路径为 URL
+        final_path = os.path.join(processed_images_dir, target_filename)
+        final_url = path_to_url(final_path)
+
+        return jsonify({
+            "success": True,
+            "image_paths": [final_url],
+            "message": f"已选择 {selected_filename}，已更新记忆"
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/update_memory_from_prompt', methods=['POST'])
+def api_update_memory_from_prompt():
+    """
+    从用户修改的提示词中自动更新记忆
+
+    使用流程：
+    1. 用户调用 /generate_prompt 获取 AI 生成的提示词
+    2. 用户在前端修改提示词（调整设计意图）
+    3. 调用此接口，系统对比差异并自动更新记忆
+
+    输入:
+        mode=1（部件生成）:
+        {
+            "mode": 1,
+            "component_name": "履带",           // 原始调用时使用的部件名
+            "ai_prompt": "AI生成的原始提示词",    // /generate_prompt 返回的 prompt
+            "user_prompt": "用户修改后的提示词"    // 前端用户修改后的版本
+        }
+
+        mode=2（整体生成）:
+        {
+            "mode": 2,
+            "ai_prompt": "AI生成的原始提示词",
+            "user_prompt": "用户修改后的提示词"
+            // mode=2 不需要 component_name
+        }
+
+    输出:
+        {
+            "success": true,
+            "changes_detected": true/false,
+            "detected_changes": {
+                "appearance_changes": ["采用黑色金属材质"],
+                "function_changes": ["增强全地形能力"],
+                "structure_changes": [],
+                "component_name_changed": false
+            },
+            "actions_taken": ["updated appearance for 履带"],
+            "new_component_created": false,
+            "new_component_name": null
+        }
+    """
+    try:
+        data = request.json or {}
+        mode = data.get('mode')
+        component_name = data.get('component_name', '')
+        ai_prompt = data.get('ai_prompt')
+        user_prompt = data.get('user_prompt')
+
+        if mode is None:
+            return jsonify({
+                "success": False,
+                "error": "缺少 mode 参数（1=部件，2=整体）"
+            }), 400
+
+        if not ai_prompt:
+            return jsonify({
+                "success": False,
+                "error": "缺少 ai_prompt 参数"
+            }), 400
+
+        if not user_prompt:
+            return jsonify({
+                "success": False,
+                "error": "缺少 user_prompt 参数"
+            }), 400
+
+        if mode == 1 and not component_name:
+            return jsonify({
+                "success": False,
+                "error": "mode=1 时需要 component_name 参数"
+            }), 400
+
+        result = update_memory_from_prompt_change(
+            mode=mode,
+            component_name=component_name,
+            ai_prompt=ai_prompt,
+            user_prompt=user_prompt,
+            memory_db=memory_db
+        )
+
+        # 如果有实际变更，保存记忆
+        if result.get("success") and result.get("actions_taken"):
+            save_memory()
+            print(f"[UpdateMemory] 记忆已保存到磁盘")
+
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({
@@ -1001,8 +1259,11 @@ def api_qa_switch():
 
         # 如果传入问题，直接处理（测试模式）
         if question:
+            print(f"[qa_switch] 测试模式，问题: {question}")
             from record import process_user_question
             answer = process_user_question(question)
+            print(f"[qa_switch] AI 回答: {answer[:50]}...")
+            print(f"[qa_switch] _latest_ai_answer 已设置，长度: {len(answer)}")
             return jsonify({
                 "success": True,
                 "question": question,
@@ -1205,7 +1466,7 @@ def api_update_description():
     输入:
         {
             "target_name": "履带",           // 部件名称或 "整体"
-            "desc_type": "结构",              // 描述类型：结构/功能/不确定点/外形
+            "desc_type": "结构",              // 描述类型：结构/功能/不确定点
             "old_content": "齿轮连接结构",    // 原来的内容（用于定位）
             "new_content": "螺纹连接结构"     // 修改后的内容
         }
@@ -1233,7 +1494,7 @@ def api_update_description():
         if not desc_type:
             return jsonify({
                 "success": False,
-                "message": "缺少 desc_type 参数（结构/功能/不确定点/外形）"
+                "message": "缺少 desc_type 参数（结构/功能/不确定点）"
             }), 400
 
         if not old_content:
@@ -1332,6 +1593,7 @@ def api_memory_qa():
             "has_questions": False,
             "questions": [],
             "current_index": 0,
+            "current_question": None,
             "update_result": None,
             "remaining_count": 0,
             "error": str(e)
@@ -1454,9 +1716,8 @@ def api_mico_switch():
     输出:
         {
             "success": true,
-            "previous_mode": 之前的模式,
-            "current_mode": 当前模式,
-            "text": "切换时累积的文本"（从1切换到0时）
+            "mode": 0 或 1,
+            "text": "切换时累积的文本"（仅从1切换到0时有值）
         }
     """
     try:
@@ -1519,11 +1780,13 @@ if __name__ == '__main__':
     print("  POST /ai_feedback         - 按需调用")
     print("  POST /qa_switch           - 问答处理")
 
-    print("\n【图像生成】（自动读取 original_image，输出到 generated_images）")
+    print("\n【图像生成】（自动读取 original_image，输出到 Component_three 或 generated_images）")
     print("  POST /generate_prompt     - 生成提示词（自动检测粗糙参考图）")
     print("  POST /generate_image      - 调用 ComfyUI 生成")
-    print("    mode=1（部件）：自动读取 original_image/ 参考图")
+    print("    mode=1（部件）：三张候选图到 Component_three/")
     print("    mode=2（整体）：部件图由前端传入 + 自动读取粗糙参考图")
+    print("  POST /select_component_image - 用户选择一张部件候选图")
+    print("  POST /update_memory_from_prompt - 对比提示词变化，自动更新记忆")
 
     print("\n【状态查询】")
     print("  GET  /memory_status       - 查询系统状态")
@@ -1541,15 +1804,21 @@ if __name__ == '__main__':
     print("  GET  /mico_mode           - 获取当前模式")
     print("  POST /mico_switch         - 切换模式")
 
-    print("\n服务地址: http://localhost:5000")
+    print("\n服务地址: http://localhost:9000")
     print("="*70)
 
-    # 自动初始化系统（启动语音识别）
-    print("\n[自动初始化] 正在启动系统...")
+    # 自动初始化系统（跳过语音识别，测试期间禁用）
+    print("\n[自动初始化] 正在启动系统（语音识别已禁用）...")
     if init_system():
         _system_initialized = True
-        print("[自动初始化] 系统初始化成功，语音识别已启动")
-        print("\n>>> 现在可以对着麦克风说话，静音1秒后会自动触发 VLM 分析 <<<")
+        # 测试期间停止语音识别以避免API调用过多
+        try:
+            from main import stop_continuous_speech
+            stop_continuous_speech()
+            print("[自动初始化] 系统初始化成功，语音识别已禁用")
+        except Exception as e:
+            print(f"[自动初始化] 停止语音识别失败: {e}")
+        print("\n>>> 语音识别已关闭，仅通过HTTP API手动触发功能 <<<")
     else:
         print("[自动初始化] 系统初始化失败，请检查配置")
         print("  - 确保 .env 文件中设置了 GEMINI_API_KEY")
@@ -1557,7 +1826,7 @@ if __name__ == '__main__':
 
     app.run(
         host='0.0.0.0',
-        port=5000,
+        port=9000,
         debug=False,
         threaded=True
     )

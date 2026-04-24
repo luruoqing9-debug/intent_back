@@ -72,9 +72,9 @@ def image_encoder(image: Image.Image) -> np.ndarray:
 
 
 def text_encoder(text: str = "a face of a person") -> np.ndarray:
-    """将文本编码为512维向量"""
+    """将文本编码为512维向量，CLIP最大77 token，使用truncation防止超长"""
     print("[text_encoder] Encoding text...")
-    text_inputs = processor(text=text, return_tensors="pt", padding=True)
+    text_inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=77)
     outputs = model.get_text_features(**text_inputs)
 
     if hasattr(outputs, 'pooler_output'):
@@ -496,7 +496,7 @@ def process_user_question(question: str) -> str:
     global _latest_ai_answer
 
     prompt = f'''
-你是一个专业的设计助手，正在协助用户进行产品设计。请回答用户的问题，给出简洁、专业的建议。
+你是一个专业的设计助手，正在协助用户进行产品设计。请回答用户的问题，给出简洁、明确、专业的建议。最好给出一个比较准确的建议，用一句话说明，但这句话要完整回答用户的问题。
 
 用户问题：{question}
 
