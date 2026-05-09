@@ -4,7 +4,7 @@ api.py - HTTP API 接口层
 遵循 main.py 的业务逻辑，不过度拆分也不过度整合。
 
 启动方式：python api.py
-服务地址：http://localhost:9000
+服务地址：http://refinity-protofusion.pub.hsuni.top:15902
 
 文件夹说明：
 ├── original_image/      → 参考图（始终只有一张，上传新图时自动替换旧的）
@@ -48,6 +48,7 @@ api.py - HTTP API 接口层
 │   ├── POST /update_description - 修改部件描述内容
 │   ├── POST /memory_qa        - 单轮问答：问一句答一句
 │   ├── GET  /uncertain_suggestions - 获取不确定内容建议
+│   ├── POST /confirm_suggestion    - 确认采纳不确定建议
 │
 ├── 语音管理
 │   ├── GET  /speech_text      - 获取累积语音文本
@@ -65,6 +66,11 @@ import threading
 import time
 import urllib.parse
 import base64
+import mimetypes
+
+# 注册 .usdz MIME 类型（RealityKit 要求）
+mimetypes.add_type('model/vnd.usdz+zip', '.usdz')
+mimetypes.add_type('model/gltf-binary', '.glb')
 
 # 禁用警告
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
@@ -111,7 +117,7 @@ from main import (
 )
 
 # 导入 AI 反馈生成函数（供前端按需调用）
-from Feedback import generate_ai_feedback, memory_qa_round, get_uncertain_suggestions, process_user_feedback
+from Feedback import generate_ai_feedback, memory_qa_round, get_uncertain_suggestions, process_user_feedback, confirm_suggestion
 
 # 导入提示词生成函数
 from generate import process_generate_request, update_memory_from_prompt_change
@@ -128,6 +134,14 @@ from Generate_image import (
 
 # 导入记忆更新函数
 from Memory import batch_update_images, update_description_content
+
+# 导入 3D 模型生成调度器
+from generate_3d import (
+    generate_3d_model,
+    MODEL_OUTPUT_DIR, MODEL_URL_PREFIX,
+    THREE_D_IMAGE_DIR, THREE_D_IMAGE_URL_PREFIX,
+    get_3d_image, update_3d_image
+)
 
 print("[api.py] 模块导入完成")
 
@@ -152,6 +166,8 @@ os.makedirs(PROCESSED_IMAGE_DIR, exist_ok=True)
 os.makedirs(GENERATED_IMAGE_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_IMAGE_DIR, exist_ok=True)
 os.makedirs(COMPONENT_THREE_DIR, exist_ok=True)
+os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
+os.makedirs(THREE_D_IMAGE_DIR, exist_ok=True)
 
 
 def path_to_url(local_path: str) -> str:
@@ -164,7 +180,7 @@ def path_to_url(local_path: str) -> str:
                     - 相对路径：original_image/xxx.png 或 original_image\xxx.png
 
     Returns:
-        URL，如 "http://localhost:9000/images/original/xxx.png"
+        URL，如 "http://refinity-protofusion.pub.hsuni.top:15902/images/original/xxx.png"
     """
     if not local_path:
         return ""
@@ -192,15 +208,15 @@ def path_to_url(local_path: str) -> str:
         print(f"[path_to_url] folder={folder}, filename={filename}, encoded={encoded_filename}")
         # 统一 Feedback_image 到 generated_images 路由
         if folder == "Feedback_image":
-            return f"http://localhost:9000/images/generated/{encoded_filename}"
+            return f"/images/generated/{encoded_filename}"
         elif folder == "original_image":
-            return f"http://localhost:9000/images/original/{encoded_filename}"
+            return f"/images/original/{encoded_filename}"
         elif folder == "processed_images":
-            return f"http://localhost:9000/images/processed/{encoded_filename}"
+            return f"/images/processed/{encoded_filename}"
         elif folder == "generated_images":
-            return f"http://localhost:9000/images/generated/{encoded_filename}"
+            return f"/images/generated/{encoded_filename}"
         elif folder == "Component_three":
-            return f"http://localhost:9000/images/component_three/{encoded_filename}"
+            return f"/images/component_three/{encoded_filename}"
 
     return local_path
 
@@ -821,7 +837,7 @@ def api_generate_image():
         mode=1:
         {
             "success": true,
-            "candidates": ["http://localhost:9000/images/component_three/履带_0.png", ...],
+            "candidates": ["http://refinity-protofusion.pub.hsuni.top:15902/images/component_three/履带_0.png", ...],
             "reference_image_used": "original_image/xxx.png",
             "message": "已生成3张候选图，请调用 /select_component_image 选择一张"
         }
@@ -1020,7 +1036,7 @@ def api_select_component_image():
     输出:
         {
             "success": true,
-            "image_paths": ["http://localhost:9000/images/processed/履带.png"],
+            "image_paths": ["http://refinity-protofusion.pub.hsuni.top:15902/images/processed/履带.png"],
             "message": "已选择履带_1.png，已更新记忆"
         }
     """
@@ -1056,6 +1072,19 @@ def api_select_component_image():
         shutil.copy(candidate_path, target_path)
         print(f"[select] 已复制: {selected_filename} → {target_filename}")
 
+        # 同时复制一份到 3d_image/（用于后续 3D 模型生成）
+        # 复制前先删除旧素材
+        for f in os.listdir(THREE_D_IMAGE_DIR):
+            if os.path.splitext(f)[1].lower() in {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}:
+                try:
+                    os.remove(os.path.join(THREE_D_IMAGE_DIR, f))
+                    print(f"[select] 已删除旧 3D 素材: {f}")
+                except Exception:
+                    pass
+        three_d_target_path = os.path.join(THREE_D_IMAGE_DIR, target_filename)
+        shutil.copy(candidate_path, three_d_target_path)
+        print(f"[select] 已复制 3D 素材: {target_filename} → 3d_image/")
+
         # 清空 Component_three/ 中的所有图片
         image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}
         for f in os.listdir(COMPONENT_THREE_DIR):
@@ -1069,7 +1098,7 @@ def api_select_component_image():
         save_memory()
 
         # 转换路径为 URL
-        final_path = os.path.join(processed_images_dir, target_filename)
+        final_path = os.path.join(PROCESSED_IMAGE_DIR, target_filename)
         final_url = path_to_url(final_path)
 
         return jsonify({
@@ -1215,9 +1244,13 @@ def api_generate_from_answer():
     try:
         data = request.json or {}
         save_name = data.get('save_name', 'ai_design')
+        answer = data.get('answer', '')  # 新增：可选，直接传入 AI 回答
 
-        # 调用生成函数（自动获取最新 AI 回答）
-        result = generate_image_from_ai_answer(save_name=save_name)
+        # 调用生成函数（可传入 answer 参数）
+        kwargs = {"save_name": save_name}
+        if answer:
+            kwargs["ai_answer"] = answer
+        result = generate_image_from_ai_answer(**kwargs)
 
         # 转换图片路径为 URL
         if result.get("success") and result.get("image_paths"):
@@ -1261,7 +1294,7 @@ def api_qa_switch():
         if question:
             print(f"[qa_switch] 测试模式，问题: {question}")
             from record import process_user_question
-            answer = process_user_question(question)
+            answer = process_user_question(question, memory_db=memory_db)
             print(f"[qa_switch] AI 回答: {answer[:50]}...")
             print(f"[qa_switch] _latest_ai_answer 已设置，长度: {len(answer)}")
             return jsonify({
@@ -1574,18 +1607,26 @@ def api_memory_qa():
         当 has_questions=false 时，表示没有需要询问的问题了
     """
     try:
+        print("[DEBUG] /memory_qa 开始处理请求")
         data = request.get_json() or {}
 
         # 用户只需要传入回答内容（字符串）
         user_answer = data.get('answer') if data.get('answer') else None
+        print(f"[DEBUG] user_answer={user_answer}")
+        print(f"[DEBUG] memory_db 节点数={len(memory_db)}")
 
         result = memory_qa_round(memory_db, user_answer)
+        print(f"[DEBUG] memory_qa_round 返回成功, type={type(result)}")
+        print(f"[DEBUG] result keys={list(result.keys()) if result else 'None'}")
+        print(f"[DEBUG] result={json.dumps(result, ensure_ascii=False, default=str)[:500]}")
 
         # 如果有更新（不是跳过、失败、没有待回答），保存记忆
         update_result = result.get('update_result', '')
         if update_result and '失败' not in update_result and '没有待回答' not in update_result and '跳过' not in update_result:
             save_memory()
+            print("[DEBUG] 保存记忆成功")
 
+        print("[DEBUG] 准备返回 jsonify")
         return jsonify(result)
 
     except Exception as e:
@@ -1633,6 +1674,48 @@ def api_uncertain_suggestions():
             "count": 0,
             "error": str(e)
         }), 500
+
+
+@app.route('/confirm_suggestion', methods=['POST'])
+def api_confirm_suggestion():
+    """
+    用户确认采纳不确定建议后，用 LLM 提取有效信息并更新记忆。
+
+    输入:
+        {
+            "target": "履带",              // 部件名称或"整体"
+            "type": "外形",                // 描述类型：外形/功能/结构
+            "content": "还没想好外形风格",  // 原始不确定内容
+            "suggestion": "建议内容"       // AI 给出的建议
+        }
+
+    输出:
+        {
+            "success": true,
+            "updated_content": "提取后的确定描述",
+            "message": "已更新"
+        }
+    """
+    try:
+        data = request.json or {}
+        target = data.get('target', '')
+        desc_type = data.get('type', '')
+        content = data.get('content', '')
+        suggestion = data.get('suggestion', '')
+
+        if not target or not desc_type or not content or not suggestion:
+            return jsonify({"error": "缺少 target/type/content/suggestion 参数"}), 400
+
+        result = confirm_suggestion(memory_db, target, desc_type, content, suggestion)
+
+        # 更新成功后保存记忆
+        if result.get("success"):
+            save_memory()
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 # ==================== 语音管理接口 ====================
@@ -1707,16 +1790,17 @@ def api_mico_switch():
 
     mico=0: 分贝检测模式，自动触发 VLM 分析
     mico=1: 持续发送模式，用于 LLM 问答
+    mico=2: 用户反馈录制模式，切回 mico=0 时自动处理反馈
 
     输入:
         {
-            "mode": 0 或 1    // 必需
+            "mode": 0 或 1 或 2    // 必需
         }
 
     输出:
         {
             "success": true,
-            "mode": 0 或 1,
+            "mode": 0 或 1 或 2,
             "text": "切换时累积的文本"（仅从1切换到0时有值）
         }
     """
@@ -1740,6 +1824,177 @@ def api_mico_switch():
             "success": False,
             "error": str(e)
         }), 500
+
+
+# ==================== 3D 模型生成接口 ====================
+
+
+def _clear_3d_image_folder():
+    """删除 3d_image/ 中的所有图片（3D 生成成功后调用）"""
+    image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}
+    for f in os.listdir(THREE_D_IMAGE_DIR):
+        if os.path.splitext(f)[1].lower() in image_extensions:
+            try:
+                os.remove(os.path.join(THREE_D_IMAGE_DIR, f))
+                print(f"[3D] 已删除素材图: {f}")
+            except Exception as e:
+                print(f"[3D] 删除素材图失败: {e}")
+
+@app.route('/upload_3d_image', methods=['POST'])
+def api_upload_3d_image():
+    """
+    上传 2D 素材图到 3d_image/ 文件夹。
+    每次上传会替换掉旧的文件（始终只保留一张）。
+
+    输入: multipart/form-data，字段名 "image"
+    输出: {"success": true, "filename": "xxx.png", "url": "http://..."}
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "缺少 image 文件"}), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "文件名为空"}), 400
+
+        save_path = update_3d_image(file)
+
+        return jsonify({
+            "success": True,
+            "filename": os.path.basename(save_path),
+            "url": f"{THREE_D_IMAGE_URL_PREFIX}/{os.path.basename(save_path)}"
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/generate_3d_model', methods=['POST'])
+def api_generate_3d_model():
+    """
+    将 3d_image/ 中的 2D 素材发送给第三方 3D 生成引擎，生成 3D 模型。
+
+    纯 image-to-3D 模式，不需要文本提示词。
+
+    文件夹说明：
+    - 3d_image/            → 2D 素材图来源（上传新图自动替换旧的）
+    - generated_3d_models/ → 生成的 3D 模型保存位置
+    - 通过 /models/<filename> 路由提供模型文件下载
+
+    输入:
+        {
+            "model_name": "履带"  // 可选：输出文件名（不含扩展名）
+        }
+
+    输出:
+        {
+            "success": true,
+            "model_id": "履带.usdz",
+            "model_url": "/models/履带.usdz",
+            "model_path": "/local/path/to/履带.usdz"
+        }
+    """
+    try:
+        data = request.json or {}
+        model_name = data.get('model_name')
+
+        result = generate_3d_model(
+            model_name=model_name
+        )
+
+        if result.get("success"):
+            # 生成成功后，删除 3d_image/ 中的素材图
+            _clear_3d_image_folder()
+            return jsonify(result)
+        else:
+            return jsonify(result), 500
+
+    except Exception as e:
+        import traceback
+        print(f"[generate_3d_model] ERROR: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/3d_image/<filename>')
+def serve_3d_image(filename):
+    """提供 3d_image/ 文件夹的素材图预览"""
+    filepath = os.path.join(THREE_D_IMAGE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return jsonify({"error": "素材图不存在"}), 404
+
+
+@app.route('/models/<filename>')
+def serve_3d_model(filename):
+    """提供生成的 3D 模型文件下载"""
+    filepath = os.path.join(MODEL_OUTPUT_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return jsonify({"error": "模型文件不存在"}), 404
+
+
+@app.route('/models_list', methods=['GET'])
+def api_models_list():
+    """
+    获取已处理的部件图片列表及对应的 3D 模型状态
+
+    流程：
+    1. 扫描 processed_images/ 目录获取所有 .png/.jpg 图片
+    2. 检查 generated_3d_models/ 中是否有同名 .usdz 文件
+    3. 返回图片列表，包含 3D 模型是否存在的信息
+
+    输出:
+        {
+            "models": [
+                {
+                    "name": "履带",
+                    "image_url": "images/processed/履带.png",
+                    "has_3d_model": true,
+                    "model_url": "/models/履带.usdz"
+                },
+                ...
+            ]
+        }
+    """
+    PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "processed_images")
+    MODELS_DIR = os.path.join(os.path.dirname(__file__), "generated_3d_models")
+
+    image_extensions = {'.png', '.jpg', '.jpeg', '.webp'}
+    model_extension = '.usdz'
+
+    models_list = []
+
+    if os.path.exists(PROCESSED_DIR):
+        for filename in sorted(os.listdir(PROCESSED_DIR)):
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in image_extensions:
+                continue
+
+            # 文件名（不含扩展名）作为部件名
+            name = os.path.splitext(filename)[0]
+            image_url = f"http://refinity-intentrelay.pub.hsuni.top:15902/images/processed/{filename}"
+
+            # 检查是否有对应的 .usdz 文件
+            model_filename = f"{name}{model_extension}"
+            model_path = os.path.join(MODELS_DIR, model_filename)
+            has_3d_model = os.path.exists(model_path)
+            model_url = f"http://refinity-intentrelay.pub.hsuni.top:15902/models/{model_filename}" if has_3d_model else None
+
+            models_list.append({
+                "name": name,
+                "image_url": image_url,
+                "has_3d_model": has_3d_model,
+                "model_url": model_url
+            })
+
+    return jsonify({"models": models_list})
 
 
 # ==================== 错误处理 ====================
@@ -1788,6 +2043,12 @@ if __name__ == '__main__':
     print("  POST /select_component_image - 用户选择一张部件候选图")
     print("  POST /update_memory_from_prompt - 对比提示词变化，自动更新记忆")
 
+    print("\n【3D 模型生成】")
+    print("  POST /upload_3d_image    - 上传 2D 素材图到 3d_image/")
+    print("  POST /generate_3d_model  - 将 2D 素材发送给第三方引擎生成 3D 模型")
+    print("  GET  /3d_image/<filename>- 预览 3d_image/ 中的素材图")
+    print("  GET  /models/<filename>  - 下载已生成的 3D 模型文件")
+
     print("\n【状态查询】")
     print("  GET  /memory_status       - 查询系统状态")
     print("  GET  /components_list     - 获取部件列表")
@@ -1795,6 +2056,7 @@ if __name__ == '__main__':
     print("  POST /update_description  - 修改部件描述内容")
     print("  POST /memory_qa           - 单轮问答：问一句答一句")
     print("  GET  /uncertain_suggestions - 获取不确定内容建议")
+    print("  POST /confirm_suggestion    - 确认采纳不确定建议")
 
     print("\n【语音管理】")
     print("  GET  /speech_text         - 获取累积语音文本")
@@ -1804,21 +2066,14 @@ if __name__ == '__main__':
     print("  GET  /mico_mode           - 获取当前模式")
     print("  POST /mico_switch         - 切换模式")
 
-    print("\n服务地址: http://localhost:9000")
+    print("\n服务地址: http://refinity-intentrelay.pub.hsuni.top:15902")
     print("="*70)
 
-    # 自动初始化系统（跳过语音识别，测试期间禁用）
-    print("\n[自动初始化] 正在启动系统（语音识别已禁用）...")
+    # 自动初始化系统（语音识别保持运行）
+    print("\n[自动初始化] 正在启动系统...")
     if init_system():
         _system_initialized = True
-        # 测试期间停止语音识别以避免API调用过多
-        try:
-            from main import stop_continuous_speech
-            stop_continuous_speech()
-            print("[自动初始化] 系统初始化成功，语音识别已禁用")
-        except Exception as e:
-            print(f"[自动初始化] 停止语音识别失败: {e}")
-        print("\n>>> 语音识别已关闭，仅通过HTTP API手动触发功能 <<<")
+        print("[自动初始化] 系统初始化成功，语音识别已启用")
     else:
         print("[自动初始化] 系统初始化失败，请检查配置")
         print("  - 确保 .env 文件中设置了 GEMINI_API_KEY")

@@ -101,9 +101,10 @@ def get_component_memory_text(component_data: dict) -> str:
     function_list = component_data.get('function_descriptions', [])
     structure_list = component_data.get('structure_descriptions', [])
 
-    appearance_text = "".join([d.get('content', '') for d in appearance_list])
-    function_text = "".join([d.get('content', '') for d in function_list])
-    structure_text = "".join([d.get('content', '') for d in structure_list])
+    # 仅提取 status=1（确定）的描述
+    appearance_text = "".join([d.get('content', '') for d in appearance_list if d.get('status', 1) == 1])
+    function_text = "".join([d.get('content', '') for d in function_list if d.get('status', 1) == 1])
+    structure_text = "".join([d.get('content', '') for d in structure_list if d.get('status', 1) == 1])
 
     return f'''
 部件名称：{component_name}
@@ -134,20 +135,24 @@ def get_overall_memory_text(memory_db: dict) -> str:
     # 合并所有整体节点信息
     overall_text = ""
     for node in overall_nodes:
-        design_background = node.get('design_background', '')
-        if design_background:
-            overall_text += f"设计背景：{design_background}\n"
+        design_background_list = node.get('design_background', [])
+        if design_background_list:
+            bg_texts = [d.get('content', '') if isinstance(d, dict) else d.content for d in design_background_list]
+            overall_text += f"设计背景：{'；'.join(bg_texts)}\n"
 
         appearance_list = node.get('overall_appearances', [])
         function_list = node.get('overall_functions', [])
         structure_list = node.get('overall_structures', [])
 
         for d in appearance_list:
-            overall_text += f"整体外形：{d.get('content', '')}\n"
+            if d.get('status', 1) == 1:
+                overall_text += f"整体外形：{d.get('content', '')}\n"
         for d in function_list:
-            overall_text += f"整体功能：{d.get('content', '')}\n"
+            if d.get('status', 1) == 1:
+                overall_text += f"整体功能：{d.get('content', '')}\n"
         for d in structure_list:
-            overall_text += f"整体结构：{d.get('content', '')}\n"
+            if d.get('status', 1) == 1:
+                overall_text += f"整体结构：{d.get('content', '')}\n"
 
     return overall_text if overall_text else "暂无整体设计记忆"
 
@@ -749,7 +754,7 @@ def update_memory_from_prompt_change(
 - function：功能用途、使用方式、性能要求
 - structure：部件关系、连接方式、布局结构
 
-{"以下是当前产品包含的部件：\\n" + "、".join(component_names) if component_names else ""}
+{"以下是当前产品包含的部件：" + chr(10) + "、".join(component_names) if component_names else ""}
 
 返回JSON格式：
 {{
@@ -758,7 +763,7 @@ def update_memory_from_prompt_change(
         {{"type": "add", "category": "function", "new": "新增功能描述", "assigned_to": "部件名 或 overall"}},
         {{"type": "remove", "category": "structure", "old": "被移除的结构特征原文", "assigned_to": "部件名 或 overall"}}
     ],
-    {"\"implied_component_name\": \"新部件名称 或 null\"," if mode == 1 else ""}
+    改为： {('"implied_component_name": "新部件名称 或 null",') if mode == 1 else ''}
 }}
 
 注意：

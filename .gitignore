@@ -1,4 +1,11 @@
-# Python
+venv/
+__pycache__/
+*.pyc
+api.log
+*.log
+generated_3d_models/
+.claude/settings.local.json
+.DS_Store# Python
 __pycache__/
 *.py[cod]
 *$py.class

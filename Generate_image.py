@@ -270,7 +270,9 @@ def prepare_images_with_padding(image_paths: List[str], total_slots: int = 9) ->
 
 # ========== ComfyUI API 配置 ==========
 
-COMFYUI_URL = "http://localhost:8000"
+# 5090 服务器 ComfyUI 地址
+COMFYUI_URL = "http://192.168.199.27:8188"
+# 本地客户端地址（备用）：COMFYUI_URL = "http://10.195.25.233:8000"
 API_CLIENT_ID = "comfyui-54ae45038ffb9ec10eb61cf40f84c436623b70e64a5cbcd9bb4cc864a099c7bd"
 COMFY_API_KEY = "comfyui-54ae45038ffb9ec10eb61cf40f84c436623b70e64a5cbcd9bb4cc864a099c7bd"  # ComfyAPI API Key
 
@@ -774,7 +776,7 @@ def prepare_workflow_component(
                 "seed": seed if seed is not None else 42,
                 "aspect_ratio": "auto",
                 "response_modalities": "IMAGE+TEXT",
-                "system_prompt": "You are a top-tier image generation expert and must always produce images. When a user provides a reference image, recognize it as a preliminary physical white model or low-fidelity prototype, using it solely as a framework reference for spatial proportions, mass distribution, and basic structure.\nThe physical white film reference image provided by the user must be strictly regarded as the core framework, and about 60% of the visual center of gravity should accurately reference the overall outline, volume ratio, and spatial position relationship of each component of the original image. For example, the layout of omnidirectional wheels, the low height and basic geometric shape of the chassis, these core structural features must be highly restored and should not be significantly modified or arbitrarily moved.\nAt the same time, you should independently incorporate reasonable visual details, material textures, and functional components based on industrial design logic, transforming the rudimentary white film into a professional design work with high completion.\nIf the user's prompt is vague or lacks specific visual descriptions, you must exercise creativity and conceive a concrete visual concept based on the morphological characteristics of the white film. Always prioritize generating high-quality, concrete visual images, ensuring the output respects the original physical contours while embodying forward-thinking industrial aesthetics."
+                "system_prompt": "You are a top-tier image generation expert and must always produce images. When a user provides a reference image, recognize it as a preliminary physical white model or low-fidelity prototype, using it solely as a framework reference for spatial proportions, mass distribution, and basic structure.\nThe physical white film reference image provided by the user must be strictly regarded as the core framework, and about 60% of the visual center of gravity should accurately reference the overall outline, volume ratio, and spatial position relationship of each component of the original image. For example, the layout of omnidirectional wheels, the low height and basic geometric shape of the chassis, these core structural features must be highly restored and should not be significantly modified or arbitrarily moved.\nDuring the generation process, you must ensure the output is a complete and standalone component image, strictly avoiding incomplete compositions, truncated parts, or partial views. The image must feature an extremely clean and pure background (such as a professional pure white or light gray studio backdrop), eliminating any cluttered lines or distracting elements to ensure the visual focus remains entirely on the component itself.\nIf the user's prompt is vague or lacks specific visual descriptions, you must exercise creativity and conceive a concrete visual concept based on the morphological characteristics of the white film. Always prioritize generating high-quality, concrete visual images, ensuring the output respects the original physical contours while embodying forward-thinking industrial aesthetics."
             }
         },
         "30": {
@@ -997,6 +999,19 @@ def generate_overall_image(
     # 获取输出图片
     saved_paths = client.get_output_images(prompt_id, output_dir, save_name)
 
+    # 复制第一张图到 3d_image/overall.png（供 3D 生成使用）
+    if saved_paths:
+        os.makedirs(THREE_D_IMAGE_DIR, exist_ok=True)
+        src = saved_paths[0] if isinstance(saved_paths, list) else saved_paths
+        dest = os.path.join(THREE_D_IMAGE_DIR, "overall.png")
+        for old in os.listdir(THREE_D_IMAGE_DIR):
+            try:
+                os.remove(os.path.join(THREE_D_IMAGE_DIR, old))
+            except Exception:
+                pass
+        shutil.copy2(src, dest)
+        print(f"[3d_image] Copied overall: {dest}")
+
     return saved_paths
 
 
@@ -1133,13 +1148,17 @@ def generate_image_from_folder(
 # Feedback_image 文件夹路径（AI问答后生成的图片）
 FEEDBACK_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "Feedback_image")
 
+# 3d_image 文件夹路径（3D 生成素材，始终只有一张）
+THREE_D_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "3d_image")
+
 
 def generate_image_from_ai_answer(
     workflow_path: str = TEXT_TO_IMAGE_WORKFLOW_PATH,
     seed: int = None,
     output_dir: str = None,
     save_name: str = "ai_design",
-    timeout: int = 300
+    timeout: int = 300,
+    ai_answer: str = None  # 新增：可选，直接传入 AI 回答内容
 ) -> dict:
     """
     从最新 AI 回答自动提取提示词并生成图片
@@ -1150,10 +1169,12 @@ def generate_image_from_ai_answer(
     3. 系统自动获取最新 AI 回答
     4. LLM 从回答中提取英文提示词
     5. 调用 ComfyUI Text-to-Image workflow 生成图片
-    6. 自动清空 AI 回答记录
+    6. 复制第一张图到 3d_image/ai_feedback.png（供 3D 生成使用）
+    7. 自动清空 AI 回答记录
 
     注意：
     - 图片保存到 Feedback_image 文件夹
+    - 3d_image/ 旧文件会被清空，新图以 ai_feedback.png 存入
     - 调用此函数会自动清空 AI 回答记录
     - 如果没有 AI 回答记录，会返回错误
 
@@ -1183,17 +1204,18 @@ def generate_image_from_ai_answer(
     print(f"\n=== 从 AI 回答生成图片 ===")
     print(f"[Output] Directory: {output_dir}")
 
-    # 1. 获取最新 AI 回答
-    ai_answer = get_latest_ai_answer()
-
-    if not ai_answer:
-        print("[Error] No AI answer recorded")
-        return {
-            "success": False,
-            "error": "没有AI回答记录，请先在mico=1模式下提问"
-        }
-
-    print(f"[AI Answer] {ai_answer[:100]}...")
+    # 1. 获取 AI 回答（优先使用传入参数，否则从全局变量获取）
+    if ai_answer:
+        print(f"[AI Answer] 使用传入参数: {ai_answer[:100]}...")
+    else:
+        ai_answer = get_latest_ai_answer()
+        if not ai_answer:
+            print("[Error] No AI answer recorded")
+            return {
+                "success": False,
+                "error": "没有AI回答记录，请先在mico=1模式下提问"
+            }
+        print(f"[AI Answer] 从全局变量获取: {ai_answer[:100]}...")
 
     # 2. 从 AI 回答中提取提示词
     extract_prompt = f'''
@@ -1296,7 +1318,20 @@ def generate_image_from_ai_answer(
 
         print(f"[Result] Generated images: {saved_paths}")
 
-        # 8. 清空 AI 回答记录（下一次问答会用新的）
+        # 8. 复制第一张图到 3d_image/ai_feedback.png（供 3D 生成使用）
+        if saved_paths:
+            os.makedirs(THREE_D_IMAGE_DIR, exist_ok=True)
+            src = saved_paths[0] if isinstance(saved_paths, list) else saved_paths
+            dest = os.path.join(THREE_D_IMAGE_DIR, "ai_feedback.png")
+            for old in os.listdir(THREE_D_IMAGE_DIR):
+                try:
+                    os.remove(os.path.join(THREE_D_IMAGE_DIR, old))
+                except Exception:
+                    pass
+            shutil.copy2(src, dest)
+            print(f"[3d_image] Copied: {dest}")
+
+        # 9. 清空 AI 回答记录（下一次问答会用新的）
         clear_latest_ai_answer()
 
         return {

@@ -459,7 +459,7 @@ def test_comfyui_connection():
 
     except Exception as e:
         print(f"[失败] ComfyUI 未运行: {e}")
-        print("  请确保 ComfyUI 服务已启动 (localhost:8000)")
+        print("  请确保 ComfyUI 服务已启动 (192.168.199.27:8188)")
         return False
 
 

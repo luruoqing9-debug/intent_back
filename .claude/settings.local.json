@@ -3,7 +3,9 @@
     "allow": [
       "Bash(ls:*)",
       "Bash(python -c ':*)",
-      "Bash(/Users/chenpei/Desktop/intentrelay/venv/bin/python *)"
+      "Bash(/Users/chenpei/Desktop/intentrelay/venv/bin/python *)",
+      "Bash(python3 *)",
+      "Bash(usdrecord *)"
     ]
   }
 }

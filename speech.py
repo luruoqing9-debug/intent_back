@@ -47,8 +47,8 @@ CHANNELS = 1
 RATE = 16000
 
 # ========== 分贝检测参数（仅 mico=0 使用）==========
-DB_THRESHOLD = 30  # 分贝阈值
-SILENCE_DURATION = 1.0  # 连续静音时长（秒）后停止
+DB_THRESHOLD = 50  # 分贝阈值（30太低，底噪会被误判为说话）
+SILENCE_DURATION = 2.0  # 连续静音时长（秒）后停止
 
 # ========== 模式状态 ==========
 _current_mico = 0  # 当前模式，默认 mico=0
@@ -58,9 +58,16 @@ def set_mico_mode(mode: int):
     设置当前模式
 
     Args:
-        mode: 0 = 分贝检测模式（自动触发），1 = 持续发送模式（手动获取）
+        mode: 0 = 分贝检测模式（自动触发），
+              1 = 持续发送模式（手动获取），
+              2 = 用户反馈录制模式（持续录音，切回 mico=0 时自动触发回调）
     """
     global _current_mico
+
+    # mico=2 → mico=0：触发回调（反馈录制结束）
+    if _current_mico == 2 and mode == 0:
+        _trigger_mico2_callback()
+
     _current_mico = mode
     print(f"[speech] 模式切换: mico={mode}")
 
@@ -72,10 +79,37 @@ def get_mico_mode() -> int:
 # ========== 回调函数 ==========
 _on_speech_end_callback = None
 
+# mico=2 专用回调（用户反馈）
+_on_feedback_end_callback = None
+
 def set_speech_end_callback(callback):
     """设置语音结束回调函数（仅 mico=0 模式使用）"""
     global _on_speech_end_callback
     _on_speech_end_callback = callback
+
+def set_feedback_callback(callback):
+    """设置用户反馈录制结束回调（mico=2 → mico=0 时触发）"""
+    global _on_feedback_end_callback
+    _on_feedback_end_callback = callback
+
+def _trigger_mico2_callback():
+    """触发 mico=2 结束回调（切换回 mico=0 时调用）"""
+    global _on_feedback_end_callback, _speech_client
+
+    final_text = ""
+    if _speech_client:
+        final_text = _speech_client.get_text().strip()
+        _speech_client.clear_text()  # 清空累积文本
+
+    if final_text and len(final_text) > 5:
+        print(f"【反馈录制结束】文本: '{final_text}'")
+        if _on_feedback_end_callback:
+            try:
+                _on_feedback_end_callback(final_text)
+            except Exception as e:
+                print(f"【反馈回调错误】{e}")
+    else:
+        print(f"【反馈录制结束】文本太短或为空: '{final_text}'")
 
 
 def calculate_db(audio_data: bytes) -> float:
@@ -189,8 +223,8 @@ class RTASRClient:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
 
-                if _current_mico == 1:
-                    # mico=1 模式：持续发送，不做分贝检测
+                if _current_mico == 1 or _current_mico == 2:
+                    # mico=1 持续发送 / mico=2 反馈录制：持续发送音频数据
                     if self.ws and self.handshake_done:
                         self.ws.send(data)
 
@@ -219,12 +253,16 @@ class RTASRClient:
                         if self.is_speaking:
                             if self.silence_start_time is None:
                                 self.silence_start_time = time.time()
+                                print(f"【进入静音】分贝={db:.1f}，开始计时...")
                             else:
                                 elapsed = time.time() - self.silence_start_time
                                 if elapsed >= SILENCE_DURATION:
                                     # 连续静音超过阈值，说话结束
                                     print(f"【说话结束】静音{elapsed:.1f}秒")
                                     self.is_speaking = False
+
+                                    # 等待 _recv 线程处理完讯飞的最终结果
+                                    time.sleep(0.5)
 
                                     # 触发回调
                                     self._trigger_callback()

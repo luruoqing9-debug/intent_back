@@ -70,6 +70,11 @@ def interactive_test():
         print("  15. POST /qa_switch           - 问答处理（mico=1→0切换时调用）")
         print("  16. POST /generate_from_answer - 从最新AI回答生成图片")
 
+        print("\n【3D 模型生成】")
+        print("  17. POST /upload_3d_image     - 上传 2D 素材图到 3d_image/")
+        print("  18. POST /generate_3d_model   - 将 3d_image/ 中的素材发送给第三方引擎生成 3D 模型")
+        print("  19. GET  /3d_image/<filename> - 预览 3d_image/ 中的素材图")
+
         print("\n【其他】")
         print("  20. 清空屏幕")
         print("  0. 退出")
@@ -311,6 +316,53 @@ def interactive_test():
                 json={}  # 不需要参数，自动命名
             )
             print_response(r)
+
+        elif choice == "17":
+            print("\n>>> 上传 2D 素材图到 3d_image/")
+            local_path = input("请输入本地图片路径: ").strip()
+            if local_path and os.path.exists(local_path):
+                with open(local_path, 'rb') as f:
+                    files = {'image': (os.path.basename(local_path), f)}
+                    r = requests.post(f"{BASE_URL}/upload_3d_image", files=files)
+                print_response(r)
+            else:
+                print("文件不存在")
+
+        elif choice == "18":
+            print("\n>>> 3D 模型生成")
+            prompt = input("请输入提示词: ").strip()
+            model_name = input("请输入模型名称（可选，默认从素材图名提取）: ").strip()
+
+            if prompt:
+                payload = {"prompt": prompt}
+                if model_name:
+                    payload["model_name"] = model_name
+
+                print("\n注意：3D 生成耗时较长，请耐心等待（通常需要 1-5 分钟）...")
+                r = requests.post(
+                    f"{BASE_URL}/generate_3d_model",
+                    json=payload,
+                    timeout=300
+                )
+                print_response(r)
+            else:
+                print("提示词不能为空")
+
+        elif choice == "19":
+            print("\n>>> 预览 3d_image/ 中的素材图")
+            try:
+                three_d_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "3d_image")
+                if os.path.exists(three_d_dir):
+                    files = [f for f in os.listdir(three_d_dir) if not f.startswith('.')]
+                    if files:
+                        print(f"当前素材图: {files[0]}")
+                        print(f"预览 URL: {BASE_URL}/3d_image/{files[0]}")
+                    else:
+                        print("3d_image/ 文件夹为空")
+                else:
+                    print("3d_image/ 文件夹不存在")
+            except Exception as e:
+                print(f"错误: {e}")
 
         elif choice == "20":
             print("\n" * 50)

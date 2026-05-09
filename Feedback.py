@@ -247,8 +247,15 @@ def get_component_memory(component_name: str, memory_db: dict = None) -> dict:
                     "appearance": [d.get("content", "") for d in data.get("appearance_descriptions", [])],
                     "function": [d.get("content", "") for d in data.get("function_descriptions", [])],
                     "structure": [d.get("content", "") for d in data.get("structure_descriptions", [])],
-                    "design_background": data.get("design_background")
                 }
+                bg = data.get("design_background", [])
+                if isinstance(bg, str) and bg.strip():
+                    result["design_background"] = [bg]
+                elif isinstance(bg, list):
+                    result["design_background"] = [d.get("content", "") for d in bg]
+                else:
+                    result["design_background"] = []
+                return result
 
     # 没找到，返回空
     return {"component_name": component_name, "appearance": [], "function": [], "structure": []}
@@ -533,23 +540,23 @@ def process_user_feedback(user_feedback: str) -> dict:
 5. 如果反馈与所有维度都不相关，全部标记为 0
 
 ## 常见表达示例
-- "可以更新颖一些" → Novelty: +0.1，其他: 0
+- "可以更新颖一些" → Novelty: 0.1，其他: 0
 - "不需要搞那些花里胡哨的创新，用最稳妥、经典的方案就行。" → Novelty: -0.1，其他: 0
-- "希望能更实用一些" → Value: +0.1，其他: 0
+- "希望能更实用一些" → Value: 0.1，其他: 0
 - "现在只是头脑风暴阶段，没必要考虑是否有用，纯发散即可。" → Value: -0.1，其他: 0
-- "要能落地执行" → Feasibility: +0.1，其他: 0
-- "不用太考虑可行性，给一些天马行空的想法" → Feasibility: -0.1, Novelty: +0.1
-- "更贴合我的设计场景" → Context-specific: +0.1，其他: 0
+- "要能落地执行" → Feasibility: 0.1，其他: 0
+- "不用太考虑可行性，给一些天马行空的想法" → Feasibility: -0.1, Novelty: 0.1
+- "更贴合我的设计场景" → Context-specific: 0.1，其他: 0
 - "跳出当前的业务框架，给我一些通用的、跨行业的设计灵感。" → Context-specific: -0.1，其他: 0
 - "好的，谢谢" → 全部: 0（与维度无关）
 
 ## 输出要求
-请输出JSON格式：
+请输出JSON格式（注意：变化值必须是合法的JSON数字，不能用+号前缀，正数直接写0.1）：
 {{
-    "Novelty": 变化值（-0.1, 0, 或 +0.1）,
-    "Value": 变化值（-0.1, 0, 或 +0.1）,
-    "Feasibility": 变化值（-0.1, 0, 或 +0.1）,
-    "Context-specific": 变化值（-0.1, 0, 或 +0.1）,
+    "Novelty": 变化值（-0.1, 0, 或 0.1）,
+    "Value": 变化值（-0.1, 0, 或 0.1）,
+    "Feasibility": 变化值（-0.1, 0, 或 0.1）,
+    "Context-specific": 变化值（-0.1, 0, 或 0.1）,
     "analysis": "简要分析用户的偏好倾向"
 }}
 '''
@@ -563,6 +570,14 @@ def process_user_feedback(user_feedback: str) -> dict:
         print(f"[User Feedback] LLM raw response: {response.text[:200] if response.text else 'Empty'}...")
 
         result = extract_and_parse_json(response.text)
+
+        if result is None:
+            # 尝试修复 +0.1 等非法 JSON 数字格式
+            import re
+            fixed_text = re.sub(r':\s*\+(\d)', r': \1', response.text)
+            if fixed_text != response.text:
+                print(f"[User Feedback] Retrying with fixed +prefix...")
+                result = extract_and_parse_json(fixed_text)
 
         if result is None:
             print("[User Feedback] Failed to parse LLM response")
@@ -668,6 +683,8 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
     """
     global _question_list, _current_question_index
     print("\n[Memory QA] 开始问答轮次...")
+    print(f"[DEBUG-QA] user_answer={user_answer}")
+    print(f"[DEBUG-QA] _question_list={_question_list}, _current_question_index={_current_question_index}")
 
     # 1. 如果有用户回答，先更新记忆
     update_result = None
@@ -742,11 +759,14 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
 
     # 4. 如果问题列表为空，且没有用户回答（新一轮开始），生成问题列表
     if not _question_list and not user_answer:
+        print("[DEBUG-QA] 进入生成问题列表分支")
         # 提取当前记忆状态
         components_data = {}
         overall_data = {}
 
+        print(f"[DEBUG-QA] 开始遍历 memory_db，共 {len(memory_db)} 个节点")
         for node_id, data in memory_db.items():
+            print(f"[DEBUG-QA] 处理节点: {node_id}, node_type={data.get('node_type')}")
             if data.get('node_type') == 'COMPONENT':
                 component_name = data.get('component_name', '未知部件')
 
@@ -770,7 +790,11 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
                 }
 
             elif data.get('node_type') == 'OVERALL':
-                design_background = data.get('design_background', '')
+                design_background_list = data.get('design_background', [])
+                if isinstance(design_background_list, str):
+                    design_background = [design_background_list] if design_background_list.strip() else []
+                else:
+                    design_background = [d.get('content', '') for d in design_background_list if d.get('status', 1) == 1 and d.get('content', '')]
 
                 overall_appearances_confirmed = [d.get('content', '') for d in data.get('overall_appearances', []) if d.get('status', 1) == 1 and d.get('content', '')]
                 overall_functions_confirmed = [d.get('content', '') for d in data.get('overall_functions', []) if d.get('status', 1) == 1 and d.get('content', '')]
@@ -788,7 +812,7 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
 
         if overall_data:
             memory_summary += "\n【整体】\n"
-            memory_summary += f"  设计背景：{overall_data['design_background'] if overall_data['design_background'] else '暂无'}\n"
+            memory_summary += f"  设计背景：{', '.join(overall_data['design_background']) if overall_data['design_background'] else '暂无'}\n"
             memory_summary += f"  外形（已确定）：{', '.join(overall_data['appearance_confirmed']) if overall_data['appearance_confirmed'] else '暂无'}\n"
             memory_summary += f"  功能（已确定）：{', '.join(overall_data['function_confirmed']) if overall_data['function_confirmed'] else '暂无'}\n"
             memory_summary += f"  结构（已确定）：{', '.join(overall_data['structure_confirmed']) if overall_data['structure_confirmed'] else '暂无'}\n"
@@ -967,7 +991,11 @@ def analyze_memory_and_generate_questions(memory_db: dict) -> dict:
             }
 
         elif data.get('node_type') == 'OVERALL':
-            design_background = data.get('design_background', '')
+            design_background_list = data.get('design_background', [])
+            if isinstance(design_background_list, str):
+                design_background = [design_background_list] if design_background_list.strip() else []
+            else:
+                design_background = [d.get('content', '') for d in design_background_list if d.get('status', 1) == 1 and d.get('content', '')]
 
             # 只提取确定的描述 (status=1)
             overall_appearances = [d.get('content', '') for d in data.get('overall_appearances', []) if d.get('status', 1) == 1 and d.get('content', '')]
@@ -987,7 +1015,7 @@ def analyze_memory_and_generate_questions(memory_db: dict) -> dict:
     if overall_data:
         memory_summary += "\n整体信息：\n"
         if overall_data.get('design_background'):
-            memory_summary += f"  设计背景：{overall_data['design_background']}\n"
+            memory_summary += f"  设计背景：{', '.join(overall_data['design_background'])}\n"
         if overall_data.get('appearance'):
             memory_summary += f"  外形：{', '.join(overall_data['appearance'])}\n"
         if overall_data.get('function'):
@@ -1203,8 +1231,9 @@ def get_uncertain_suggestions(memory_db: dict) -> dict:
                     context_info.append(f"[{name} 结构] {desc.get('content', '')}")
 
         elif data.get('node_type') == 'OVERALL':
-            if data.get('design_background'):
-                context_info.append(f"[整体背景] {data.get('design_background')}")
+            for bg in data.get('design_background', []):
+                if bg.get('status', 1) == 1 and bg.get('content', '').strip():
+                    context_info.append(f"[整体背景] {bg.get('content', '')}")
 
     context_text = "\n".join(context_info) if context_info else "暂无其他参考信息"
 
@@ -1216,7 +1245,7 @@ def get_uncertain_suggestions(memory_db: dict) -> dict:
 
     suggest_prompt = f'''
 你是一个产品设计助手。用户正在进行设计探索，有一些内容尚未确定。
-请根据已有的上下文信息，为每条不确定内容提供简短的建议方向。
+请根据已有的上下文信息，为每条不确定内容提供一条直接明了的建议。
 
 ## 已确定的上下文信息
 {context_text}
@@ -1226,9 +1255,10 @@ def get_uncertain_suggestions(memory_db: dict) -> dict:
 
 ## 任务
 为每条不确定内容生成一条简短建议（不超过30字）：
-- 建议应该具体、有启发性
-- 结合已有上下文信息
-- 不要给出最终答案，而是提供思考方向
+- 建议必须是一个明确的陈述句，不要使用问句
+- 建议应该直接给出设计方向或具体方案
+- 结合已有上下文信息，确保建议与整体设计一致
+- 不要使用"可以考虑""或许""也许"等模糊语气词，要给出确定的建议
 
 ## 输出格式（严格遵守JSON格式）
  {{
@@ -1296,3 +1326,111 @@ def get_uncertain_suggestions(memory_db: dict) -> dict:
             "count": len(uncertain_items),
             "error": str(e)
         }
+
+
+# ========== 确认采纳不确定建议 ==========
+
+def confirm_suggestion(memory_db: dict, target: str, desc_type: str, original_content: str, ai_suggestion: str) -> dict:
+    """
+    用户确认采纳某条不确定建议后，用 LLM 提取有效信息并更新记忆。
+
+    Args:
+        memory_db: 记忆数据库
+        target: 部件名称或"整体"
+        desc_type: 描述类型（外形/功能/结构）
+        original_content: 原始不确定内容（status=0）
+        ai_suggestion: AI 给出的建议
+
+    Returns:
+        {
+            "success": True/False,
+            "updated_content": "更新后的内容",
+            "message": "提示信息"
+        }
+    """
+    print(f"\n[Confirm Suggestion] target='{target}', type='{desc_type}', original='{original_content}'")
+    print(f"[Confirm Suggestion] suggestion='{ai_suggestion}'")
+
+    # 1. 用 LLM 提取建议中的有效设计信息
+    extract_prompt = f'''
+你是一个设计信息提取助手。用户已经采纳了一条关于设计不确定内容的建议，现在需要你提取建议中的有效设计信息。
+
+## 原始不确定内容
+{original_content}
+
+## 用户采纳的AI建议
+{ai_suggestion}
+
+## 任务
+从AI建议中提取有效的设计信息，形成一条简洁明确的设计描述（status=1的确定描述）。
+- 去除模糊语气词和不确定性表述
+- 保留具体的设计方向、特征描述
+- 不超过30字
+
+只输出提取后的内容，不要其他解释。
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[extract_prompt]
+        )
+        extracted_content = response.text.strip()
+        print(f"[Confirm Suggestion] LLM提取: '{extracted_content}'")
+    except Exception as e:
+        print(f"[Confirm Suggestion] LLM提取失败: {e}")
+        extracted_content = ai_suggestion
+
+    # 2. 更新记忆中的对应条目：status=0 → 1，内容更新为提取后的结果
+    type_mapping = {
+        "外形": "appearance_descriptions",
+        "功能": "function_descriptions",
+        "结构": "structure_descriptions"
+    }
+
+    if desc_type not in type_mapping:
+        return {"success": False, "updated_content": extracted_content, "message": f"不支持的描述类型：'{desc_type}'"}
+
+    field_name = type_mapping[desc_type]
+
+    if target.lower() == "整体":
+        overall_field_mapping = {
+            "外形": "overall_appearances",
+            "功能": "overall_functions",
+            "结构": "overall_structures"
+        }
+        field_name = overall_field_mapping.get(desc_type)
+        if not field_name:
+            return {"success": False, "updated_content": extracted_content, "message": f"整体不支持该描述类型"}
+
+    found = False
+    for node_id, data in memory_db.items():
+        is_match = False
+        if target.lower() == "整体" and data.get('node_type') == 'OVERALL':
+            is_match = True
+        elif data.get('node_type') == 'COMPONENT' and data.get('component_name', '').lower() == target.lower():
+            is_match = True
+
+        if is_match:
+            descriptions = data.get(field_name, [])
+            for desc in descriptions:
+                if desc.get('content', '') == original_content and desc.get('status', 1) == 0:
+                    desc['content'] = extracted_content
+                    desc['status'] = 1
+                    found = True
+                    break
+
+            if found:
+                from datetime import datetime, timezone
+                data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                return {
+                    "success": True,
+                    "updated_content": extracted_content,
+                    "message": f"已将 '{target}' 的 '{desc_type}' 描述从不确定更新为确定"
+                }
+
+    return {
+        "success": False,
+        "updated_content": extracted_content,
+        "message": f"未找到匹配的不确定内容：target='{target}', type='{desc_type}', content='{original_content}'"
+    }

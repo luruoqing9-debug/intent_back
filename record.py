@@ -44,8 +44,19 @@ processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", cache_
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     print("[record.py] Warning: GEMINI_API_KEY not set. Please set it in environment variables or .env file")
+
+# 配置 httpx 客户端以使用代理（genai SDK 默认不走环境变量代理）
+import httpx
+_gemini_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+_gemini_httpx = httpx.Client(trust_env=True, follow_redirects=True) if _gemini_proxy else None
+
+_http_opts = {"api_version": "v1beta"}
+if _gemini_httpx:
+    _http_opts["httpx_client"] = _gemini_httpx
+    print(f"[record.py] Gemini API 代理已配置: {_gemini_proxy}")
+
 client = genai.Client(
-    http_options={"api_version": "v1beta"},
+    http_options=_http_opts,
     api_key=api_key,
 )
 print("[record.py] 模型加载完毕。")
@@ -155,6 +166,7 @@ Based on your analysis, you must generate a JSON object with the following keys.
 - User Voice (Transcript): {transcript_text}
 
 ### [JSON Keys]
+0. "relevant": Boolean. Is the user's speech or behavior related to the current design task? If the user is talking about something completely unrelated (e.g., ordering food, casual chat, weather), set to false. If it's about the product being designed, set to true.
 1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
 2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
 3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
@@ -227,15 +239,16 @@ You are provided with {len(image_bytes_list)} sequential video frames showing th
 - User Voice (Transcript): {transcript_text}
 
 ### [Your Task]
-Based on your analysis of ALL frames, determine the user's current behavioral intention.
+First, determine if the user's speech or behavior is related to the current design task. Only design-related speech should be analyzed. Design-related includes: describing a product or component, discussing appearance/function/structure, mentioning materials/colors/shapes/usage scenarios/target users/design goals. Irrelevant includes: casual chat with others, administrative topics, personal matters, weather, food, etc.
 
 Generate a JSON object with the following keys. Your entire response must be ONLY the JSON object:
 
-1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
-2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
+0. "relevant": Boolean (true or false). Set to true ONLY if the user's speech or behavior is clearly about the product being designed. Set to false if it's unrelated (e.g., casual chat, administrative matters, personal topics).
+1. "type": Identify if the target is "overall" (entire product) or "component" (specific part). Only set this if relevant=true.
+2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base"). Only set this if relevant=true.
 3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
-4. "Behavior description": A single, concise sentence describing the user's interaction based on the video frames and trigger types (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
-5. "User intent": Classify the intent into EXACTLY one of the following strings:
+4. "Behavior description": A single, concise sentence describing the user's interaction based on the video frames and trigger types (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort"). Only set this if relevant=true.
+5. "User intent": Classify the intent into EXACTLY one of the following strings. Only set this if relevant=true:
     - "Appearance design": Related to visual form, proportions, materials, or surface details.
     - "Functional concept": Related to functional objectives or improving features.
     - "Structural design": Related to component relationships, layout, or adjustments.
@@ -287,15 +300,16 @@ You are analyzing a designer's spoken words to understand their current design i
 - User Voice (Transcript): {transcript_text}
 
 ### [Your Task]
-Based on the user's spoken words, determine their current design intention.
+First, determine if the user's speech is related to the current design task. Only design-related speech should be analyzed. Design-related speech includes: describing a product or component, discussing its appearance/function/structure, mentioning materials, colors, shapes, usage scenarios, target users, or design goals. Irrelevant speech includes: casual chat with others, administrative topics, personal matters, weather, food, etc.
 
 Generate a JSON object with the following keys. Your entire response must be ONLY the JSON object:
 
-1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
-2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "履带", "底座").
+0. "relevant": Boolean (true or false). Set to true ONLY if the user's speech is clearly about the product being designed. Set to false if it's unrelated (e.g., casual chat, administrative matters, personal topics).
+1. "type": Identify if the target is "overall" (entire product) or "component" (specific part). Only set this if relevant=true.
+2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "履带", "底座"). Only set this if relevant=true.
 3. "User Speaking": Transcribe the user's exact words from the transcript.
-4. "Behavior description": A single, concise sentence describing what the user is doing (e.g., "The designer is describing the overall design concept of a night-time patrol robot").
-5. "User intent": Classify the intent into EXACTLY one of the following strings:
+4. "Behavior description": A single, concise sentence describing what the user is doing. Only set this if relevant=true.
+5. "User intent": Classify the intent into EXACTLY one of the following strings. Only set this if relevant=true:
     - "Appearance design": Related to visual form, proportions, materials, or surface details.
     - "Functional concept": Related to functional objectives or improving features.
     - "Structural design": Related to component relationships, layout, or adjustments.
@@ -427,7 +441,8 @@ def process_user_input(
 
 
 def handle_mode_switch_to_mico0(
-    previous_mico: MicMode = 1
+    previous_mico: MicMode = 1,
+    memory_db: dict = None
 ) -> str:
     """
     处理从 mico=1 切换到 mico=0 的逻辑。
@@ -439,6 +454,7 @@ def handle_mode_switch_to_mico0(
 
     Args:
         previous_mico: 之前的模式（应该是1，表示从问答模式切换）
+        memory_db: 记忆数据库（可选，传入后会将设计背景注入到prompt中）
 
     Returns:
         LLM的回答内容
@@ -460,7 +476,7 @@ def handle_mode_switch_to_mico0(
 
     # 调用LLM问答
     print("[Mode Switch] 触发LLM问答")
-    return process_user_question(transcript_text)
+    return process_user_question(transcript_text, memory_db=memory_db)
 
 
 # ========== 最新 AI 回答记录 ==========
@@ -481,7 +497,7 @@ def clear_latest_ai_answer():
     print("[AI Answer] Cleared latest answer record")
 
 
-def process_user_question(question: str) -> str:
+def process_user_question(question: str, memory_db: dict = None) -> str:
     """
     处理用户提问（mico=1时调用），让LLM生成回答。
 
@@ -489,14 +505,38 @@ def process_user_question(question: str) -> str:
 
     Args:
         question: 用户的问题文本
+        memory_db: 记忆数据库（可选，传入后会将设计背景注入到prompt中）
 
     Returns:
         LLM的回答内容
     """
     global _latest_ai_answer
 
+    # 从记忆中提取设计背景
+    background_context = ""
+    if memory_db:
+        for node_id, data in memory_db.items():
+            if data.get('node_type') == 'OVERALL':
+                backgrounds = data.get('design_background', [])
+                if isinstance(backgrounds, str) and backgrounds.strip():
+                    background_context += f"- {backgrounds}\n"
+                elif isinstance(backgrounds, list):
+                    for bg in backgrounds:
+                        content = bg.get('content', '') if isinstance(bg, dict) else bg
+                        if content.strip():
+                            background_context += f"- {content}\n"
+
+    if background_context:
+        background_context = "## 当前设计背景\n" + background_context
+    else:
+        background_context = ""
+
     prompt = f'''
-你是一个专业的设计助手，正在协助用户进行产品设计。请回答用户的问题，给出简洁、明确、专业的建议。最好给出一个比较准确的建议，用一句话说明，但这句话要完整回答用户的问题。
+你是一个工业设计师。你正在协助用户进行产品设计。请回答用户的问题，给出一个明确的建议——注意只有一个建议，用一句话说明。
+
+你的回答应该侧重于具体的视觉特征，例如：外形、材质、颜色、表面处理、结构细节。描述要能让图像生成模型理解具体的外观。
+
+{background_context}
 
 用户问题：{question}
 
@@ -713,6 +753,52 @@ def llm_merge_names(name1: str, name2: str) -> tuple:
     else:
         print(f"[llm_merge] '{name1}' and '{name2}' merged to '{result}'")
         return result, True
+
+
+def llm_decide_merge(original: str, new: str) -> tuple:
+    """
+    当两条描述语义相似度高（>0.85）时，让 LLM 判断如何处理。
+    设计类语言敏感，纯向量相似度不够准确，需要 LLM 分析是否存在实质冲突。
+
+    Returns:
+        (action, content)
+        action: "keep" 新内容无实质增量，保留原有
+                "replace" 新内容更准确、更完整，或与原有存在设计冲突 → 用新的替换
+                "merge" 两者包含互补信息，合并成一条
+        content: 处理后的最终内容
+    """
+    prompt = f'''你是一个产品设计助手。现在有两条关于同一设计要素的描述，它们的语义相似度很高，需要你判断如何处理。
+
+设计领域特点：设计类语言非常敏感，看似相似的表述可能代表完全不同的设计意图。如果两条描述存在设计方向上的矛盾（如风格从"圆润"变为"硬朗"），这代表用户改变了设计想法，应保留最新的描述。
+
+原有描述：{original}
+新描述：{new}
+
+请分析：
+1. 两条描述是否在说同一件事？还是存在实质性的设计差异？
+2. 如果新内容相比原有内容没有实质增量，应保留原有（keep），content 填原有内容
+3. 如果新内容明显更准确、更完整，或与原有描述存在设计方向上的矛盾，应替换为新的（replace），content 填新内容
+4. 如果两者包含互补的不同信息，应合并（merge），content 填合并后的内容（完整、准确、简洁）
+
+请只输出 JSON 格式：
+{{"action": "keep/replace/merge", "content": "最终内容"}}
+'''
+
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=[prompt]
+    )
+
+    result = extract_and_parse_json(response.text)
+
+    if result is None:
+        print(f"[llm_decide] 解析失败，默认 merge")
+        return "merge", original + "，" + new
+
+    action = result.get("action", "merge")
+    content = result.get("content", "")
+    print(f"[llm_decide] action={action}, content='{content[:50]}...'")
+    return action, content
 
 
 def llm_merge_descriptions(original: str, new: str) -> str:

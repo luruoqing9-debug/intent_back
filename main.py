@@ -78,6 +78,7 @@ from speech import (
     has_speech_text,
     is_speech_running,
     set_speech_end_callback,
+    set_feedback_callback,  # 新增：用户反馈回调
     set_mico_mode,  # 新增：模式切换
     get_mico_mode   # 新增：获取当前模式
 )
@@ -105,7 +106,8 @@ from Memory import (
 # 反馈模块
 from Feedback import (
     check_vlm_output,
-    generate_ai_feedback
+    generate_ai_feedback,
+    process_user_feedback
 )
 
 # 生成模块
@@ -173,6 +175,11 @@ def handle_vlm_analysis_with_text(trigger_types: list, transcript_text: str) -> 
         dict: 分析结果
     """
     global memory_db
+
+    # 追踪调用来源
+    import traceback
+    print(f"[VLM分析] 调用来源: {traceback.format_stack()[-4].strip()}")
+    print(f"[VLM分析] 传入的 transcript_text: '{transcript_text[:50]}...' ({len(transcript_text)} 字符)")
 
     result = {
         "success": False,
@@ -259,6 +266,17 @@ def handle_vlm_analysis_with_text(trigger_types: list, transcript_text: str) -> 
     print(f"    - label: {vlm_json.get('label')}")
     print(f"    - User intent: {vlm_json.get('User intent')}")
 
+    # 4.5 判断是否与设计相关
+    is_relevant = vlm_json.get("relevant", True)
+    print(f"    - relevant: {is_relevant}")
+    # 宽松比较：支持布尔值和字符串
+    if is_relevant is False or str(is_relevant).lower() == "false":
+        print(f"[VLM分析] 判断为无关内容，跳过记忆存储")
+        result["success"] = True
+        result["node"] = None
+        result["node_type"] = "skipped"
+        return result
+
     # 5. 存入记忆
     print("\n[Step 5] 存入记忆...")
     try:
@@ -336,7 +354,7 @@ def handle_qa_switch() -> dict:
     print("\n[问答] 处理切换请求...")
 
     try:
-        answer = handle_mode_switch_to_mico0(previous_mico=1)
+        answer = handle_mode_switch_to_mico0(previous_mico=1, memory_db=memory_db)
         result["question"] = "（已清空）"
         result["answer"] = answer
         result["success"] = True
@@ -393,28 +411,48 @@ def init_system() -> bool:
     print(f"  - COMPONENT: {component_count}")
     print(f"  - OVERALL: {overall_count}")
 
-    # 3. 设置语音结束回调
-    print("\n[Step 3] 设置语音回调...")
-    set_speech_end_callback(on_speech_end)
-    print("✓ 语音回调已设置")
+    # ========== 语音识别开关（临时关闭：服务器无麦克风/讯飞license过期）==========
+    ENABLE_SPEECH = False  # TODO: 恢复语音识别时改为 True
+    # ==========================================================================
 
-    # 4. 启动持续语音识别
-    print("\n[Step 4] 启动语音识别...")
+    if ENABLE_SPEECH:
+        # 3. 设置语音结束回调
+        print("\n[Step 3] 设置语音回调...")
+        set_speech_end_callback(on_speech_end)
 
-    try:
-        start_continuous_speech()
-        print("  正在初始化，请稍候...")
-        time.sleep(2)
+        # 设置用户反馈回调（mico=2 → mico=0 时触发）
+        def on_feedback_end(text):
+            print(f"\n[Feedback] 处理用户反馈: '{text}'")
+            result = process_user_feedback(text)
+            changes = result.get("dimension_changes", {})
+            weights = result.get("updated_weights", {})
+            analysis = result.get("analysis", "")
+            print(f"[Feedback] 维度变化: {changes}")
+            print(f"[Feedback] 当前权重: {weights}")
+            print(f"[Feedback] 分析: {analysis}")
 
-        if not is_speech_running():
-            print("[错误] 语音识别启动失败")
+        set_feedback_callback(on_feedback_end)
+        print("✓ 语音回调 + 反馈回调已设置")
+
+        # 4. 启动持续语音识别
+        print("\n[Step 4] 启动语音识别...")
+
+        try:
+            start_continuous_speech()
+            print("  正在初始化，请稍候...")
+            time.sleep(2)
+
+            if not is_speech_running():
+                print("[错误] 语音识别启动失败")
+                return False
+
+            print("✓ 语音识别启动成功")
+
+        except Exception as e:
+            print(f"[错误] 语音识别启动异常: {e}")
             return False
-
-        print("✓ 语音识别启动成功")
-
-    except Exception as e:
-        print(f"[错误] 语音识别启动异常: {e}")
-        return False
+    else:
+        print("\n[Step 3] 语音识别已禁用（服务器无麦克风）")
 
     # 5. 设置运行标志
     running = True
@@ -637,6 +675,18 @@ def handle_vlm_analysis(trigger_types: list = None) -> dict:
     print(f"    - type: {vlm_json.get('type')}")
     print(f"    - label: {vlm_json.get('label')}")
     print(f"    - User intent: {vlm_json.get('User intent')}")
+
+    # 5.5 判断是否与设计相关
+    is_relevant = vlm_json.get("relevant", True)
+    if is_relevant is False:
+        print(f"[VLM分析] 判断为无关内容，跳过记忆存储")
+        result["success"] = True
+        result["node"] = None
+        result["node_type"] = "skipped"
+        # 仍然清空 Operated_image
+        print("\n[Step 6] 清空 Operated_image...")
+        clear_operated_image_folder()
+        return result
 
     # 6. 存入记忆
     print("\n[Step 6] 存入记忆...")
@@ -978,14 +1028,13 @@ def switch_mico_mode(mode: int) -> dict:
 
     if mode == 0 and current_mode == 1:
         # 从 mico=1 切换到 mico=0
-        # 获取累积文本传给 LLM
-        text = get_text_and_clear()
-        result["text"] = text
-        print(f"\n[模式切换] mico=1 → mico=0")
-        print(f"[模式切换] 获取文本: '{text}'")
-
-        # 这里可以调用 LLM 问答
-        # handle_qa_switch() 或其他处理
+        # 调用 LLM 问答：获取累积语音 → Gemini → 返回回答
+        result_qa = handle_qa_switch()
+        if result_qa["success"]:
+            result["text"] = result_qa["answer"]
+            print(f"[模式切换] LLM 回答长度: {len(result_qa['answer'])} 字符")
+        else:
+            print(f"[模式切换] LLM 问答失败: {result_qa.get('answer', '未知错误')}")
 
     set_mico_mode(mode)
     print(f"[模式切换] 当前模式: mico={mode}")

@@ -38,7 +38,7 @@ from record import (
     vlm_chat_mock, vlm_chat_virtual,
     load_memory_from_json, save_memory_to_json,
     extract_and_parse_json,
-    llm_merge_names, llm_merge_descriptions,
+    llm_merge_names, llm_merge_descriptions, llm_decide_merge,
     llm_analyze_design_info,
     PhysicalTriggerType
 )
@@ -131,13 +131,14 @@ class ComponentNode(BaseMemoryNode):
 class OverallNode(BaseMemoryNode):
     """整体记忆节点"""
     node_type: NodeType = "OVERALL"
-    design_background: Optional[str] = Field(None, description="设计背景")
+    design_background: List[DescriptionWithStatus] = Field(default_factory=list, description="设计背景")
     overall_appearances: List[DescriptionWithStatus] = Field(default_factory=list, description="整体外形描述")
     overall_structures: List[DescriptionWithStatus] = Field(default_factory=list, description="整体结构描述")
     overall_functions: List[DescriptionWithStatus] = Field(default_factory=list, description="整体功能描述")
     overall_image: Optional[str] = Field(None, description="整体图片(Base64)")
     image_embedding: Optional[List[float]] = Field(None, description="图像向量嵌入")
     overall_appearance_embeddings: List[List[float]] = Field(default_factory=list, description="外形描述嵌入")
+    design_background_embeddings: List[List[float]] = Field(default_factory=list, description="设计背景嵌入")
     overall_structure_embeddings: List[List[float]] = Field(default_factory=list, description="结构描述嵌入")
     overall_function_embeddings: List[List[float]] = Field(default_factory=list, description="功能描述嵌入")
     component_ids: List[str] = Field(default_factory=list, description="关联部件ID列表")
@@ -145,7 +146,7 @@ class OverallNode(BaseMemoryNode):
 
 # ========== 描述处理函数 ==========
 
-DESCRIPTION_SIMILARITY_THRESHOLD = 0.85
+DESCRIPTION_SIMILARITY_THRESHOLD = 0.95
 
 
 def make_description(content: str, status: int = 1) -> DescriptionWithStatus:
@@ -191,14 +192,27 @@ def find_or_update_description(
         print(f"[Desc Search] Max similarity: {max_similarity:.4f}")
 
         if max_similarity > similarity_threshold:
-            print(f"[Desc Match] Merging content...")
+            print(f"[Desc Match] Similarity {max_similarity:.4f} > threshold, LLM deciding...")
             original_content = description_list[max_idx].content
-            merged_content = llm_merge_descriptions(original_content, new_content)
-            description_list[max_idx].content = merged_content
-            description_list[max_idx].status = new_status
-            merged_embedding = text_encoder(merged_content)
-            text_embeddings_list[max_idx] = merged_embedding.tolist()
-            return description_list, text_embeddings_list, True
+            action, merged_content = llm_decide_merge(original_content, new_content)
+
+            if action == "keep":
+                print(f"[Desc Match] LLM decided to keep original")
+                return description_list, text_embeddings_list, True
+            elif action == "replace":
+                print(f"[Desc Match] LLM decided to replace")
+                description_list[max_idx].content = merged_content
+                description_list[max_idx].status = new_status
+                merged_embedding = text_encoder(merged_content)
+                text_embeddings_list[max_idx] = merged_embedding.tolist()
+                return description_list, text_embeddings_list, True
+            else:  # merge
+                print(f"[Desc Match] LLM decided to merge")
+                description_list[max_idx].content = merged_content
+                description_list[max_idx].status = new_status
+                merged_embedding = text_encoder(merged_content)
+                text_embeddings_list[max_idx] = merged_embedding.tolist()
+                return description_list, text_embeddings_list, True
 
     print(f"[Desc Append] No match, appending...")
     new_desc = make_description(new_content, new_status)
@@ -417,7 +431,10 @@ def update_overall_memory(
             node = OverallNode(**data)
 
             if design_background is not None:
-                node.design_background = design_background
+                if design_background:
+                    node.design_background, node.design_background_embeddings, _ = find_or_update_description(
+                        node.design_background, design_background, 1, node.design_background_embeddings
+                    )
 
             if appearance_items:
                 for item in appearance_items:
@@ -469,13 +486,16 @@ def update_overall_memory(
     appearance_list = [make_description(item["description"], item.get("status", 1)) for item in (appearance_items or [])]
     structure_list = [make_description(item["description"], item.get("status", 1)) for item in (structure_items or [])]
     function_list = [make_description(item["description"], item.get("status", 1)) for item in (function_items or [])]
+    background_list = [make_description(design_background, 1)] if design_background else []
 
     appearance_emb = [text_encoder(item["description"]).tolist() for item in (appearance_items or [])]
     structure_emb = [text_encoder(item["description"]).tolist() for item in (structure_items or [])]
     function_emb = [text_encoder(item["description"]).tolist() for item in (function_items or [])]
+    background_emb = [text_encoder(design_background).tolist()] if design_background else []
 
     return OverallNode(
-        design_background=design_background,
+        design_background=background_list,
+        design_background_embeddings=background_emb,
         overall_appearances=appearance_list,
         overall_structures=structure_list,
         overall_functions=function_list,
@@ -888,21 +908,24 @@ def add_description_from_answer(
         "结构": "structure_descriptions"
     }
 
-    # 处理"背景"类型（design_background 是 OVERALL 节点上的单值字段，不是列表）
+    # 处理"背景"类型（design_background 是列表，增量追加）
     if desc_type == "背景":
+        new_desc = {"content": answer.strip(), "status": 1}
         for node_id, data in memory_db.items():
             if data.get('node_type') == 'OVERALL':
-                data['design_background'] = answer.strip()
+                backgrounds = data.get('design_background', [])
+                backgrounds.append(new_desc)
+                data['design_background'] = backgrounds
                 data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
-                print(f"[Success] Updated overall design_background")
-                return True, f"已更新整体设计背景：'{answer}'"
+                print(f"[Success] Added overall design_background")
+                return True, f"已为整体添加设计背景：'{answer}'"
 
         # 没找到整体节点，创建新的
         new_overall = OverallNode()
-        new_overall.design_background = answer.strip()
+        new_overall.design_background = [new_desc]
         memory_db[new_overall.node_id] = new_overall.model_dump()
         print(f"[Success] Created overall with design_background")
-        return True, f"已创建整体节点并设置设计背景：'{answer}'"
+        return True, f"已创建整体节点并添加设计背景：'{answer}'"
 
     if desc_type not in type_mapping:
         return False, f"不支持的描述类型：'{desc_type}'，可选值：外形、功能、结构、背景"
@@ -1021,7 +1044,7 @@ if __name__ == "__main__":
                     print(f"Structure: {len(node.structure_descriptions)}")
                     print(f"Function: {len(node.function_descriptions)}")
                 elif node_type == "overall":
-                    print(f"Background: {node.design_background}")
+                    print(f"Background: {len(node.design_background)} items")
                     print(f"Appearances: {len(node.overall_appearances)}")
                     print(f"Functions: {len(node.overall_functions)}")
         else:
